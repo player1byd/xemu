@@ -1,12 +1,14 @@
 name: Build
 
 on:
+  workflow_dispatch:
   workflow_call:
     inputs:
       ref:
         description: Git ref (commit, branch, or tag) to build
         required: true
         type: string
+        default: 'fix/fatal-frame-2-0.8.136-25-pr2514-dma-atapi-delay-6ms'
     outputs:
       pkg_version:
         description: Build version
