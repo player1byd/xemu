@@ -24,11 +24,14 @@
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/texture.h"
+#include "hw/xbox/nv2a/pgraph/texture-layout.h"
+#include "qemu/error-report.h"
+#include "ui/xemu-tweaks.h"
 #include "debug.h"
 #include "renderer.h"
+#include "texture-source-identity.h"
 
 static TextureBinding* generate_texture(const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
-static void texture_binding_destroy(gpointer data);
 
 struct pgraph_texture_possibly_dirty_struct {
     hwaddr addr, end;
@@ -241,6 +244,12 @@ void pgraph_gl_bind_textures(NV2AState *d)
         size_t length, palette_length;
 
         length = pgraph_get_texture_length(pg, &state);
+        if (!length) {
+            error_report("Invalid texture source layout");
+            pgraph_gl_reset_texture_stage(&r->texture_binding[i]);
+            pg->texture_dirty[i] = true;
+            continue;
+        }
         texture_vram_offset = pgraph_get_texture_phys_addr(pg, i);
         palette_vram_offset = pgraph_get_texture_palette_phys_addr_length(pg, i, &palette_length);
 
@@ -256,9 +265,15 @@ void pgraph_gl_bind_textures(NV2AState *d)
         TextureBinding *tbind = r->texture_binding[i];
         if (!pg->texture_dirty[i] && tbind) {
             bool reusable = false;
-            if (surface && tbind->draw_time == surface->draw_time) {
+            bool source_matches =
+                pgraph_gl_texture_source_identity_matches(
+                    texture_vram_offset, tbind->texture_vram_offset,
+                    is_indexed, palette_vram_offset,
+                    tbind->palette_vram_offset);
+            if (source_matches && surface &&
+                tbind->draw_time == surface->draw_time) {
                 reusable = true;
-            } else if (!surface) {
+            } else if (source_matches && !surface) {
                 possibly_dirty = check_texture_possibly_dirty(
                         d,
                         texture_vram_offset,
@@ -356,14 +371,23 @@ void pgraph_gl_bind_textures(NV2AState *d)
                             && possibly_dirty
                             && (key_out->binding->data_hash != tex_data_hash);
         if (must_destroy) {
-            texture_binding_destroy(key_out->binding);
+            pgraph_gl_texture_binding_destroy(key_out->binding);
             key_out->binding = NULL;
         }
 
         if (key_out->binding == NULL) {
             // Must create the texture
             key_out->binding = generate_texture(state, texture_data, palette_data);
+            if (!key_out->binding) {
+                key_out->possibly_dirty = true;
+                pgraph_gl_reset_texture_stage(&r->texture_binding[i]);
+                pg->texture_dirty[i] = true;
+                continue;
+            }
             key_out->binding->data_hash = tex_data_hash;
+            key_out->binding->texture_vram_offset = texture_vram_offset;
+            key_out->binding->palette_vram_offset =
+                is_indexed ? palette_vram_offset : 0;
             key_out->binding->scale = 1;
         } else {
             // Saved an upload! Reuse existing texture in graphics memory.
@@ -398,7 +422,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
             if (r->texture_binding[i]->gl_target != binding->gl_target) {
                 glBindTexture(r->texture_binding[i]->gl_target, 0);
             }
-            texture_binding_destroy(r->texture_binding[i]);
+            pgraph_gl_texture_binding_destroy(r->texture_binding[i]);
         }
         r->texture_binding[i] = binding;
         pg->texture_dirty[i] = false;
@@ -488,6 +512,39 @@ static void upload_gl_texture(GLenum gl_target,
                         8 : 16;
                 unsigned int physical_width = (width + 3) & ~3,
                              physical_height = (height + 3) & ~3;
+
+                /*
+                 * The host is required to support S3TC (asserted at renderer
+                 * init), so hand the DXT blocks straight to GL when no border
+                 * fixup is needed. This skips the CPU decompress entirely and
+                 * uploads 4-8x less data, which matters a great deal when a
+                 * title streams in many textures in one frame.
+                 *
+                 * This must not be decided per level: mixing compressed and
+                 * uncompressed internal formats across the mip chain makes
+                 * the texture incomplete and it samples as black. The border
+                 * fixup depends only on the texture, not the level, so either
+                 * every level takes this path or none does. Levels smaller
+                 * than a 4x4 block are fine to upload compressed; imageSize
+                 * is computed from the block-aligned size.
+                 */
+                bool needs_border_fixup =
+                    s.cubemap && adjusted_width != s.width;
+                if (!needs_border_fixup &&
+                    xemu_tweak_enabled(XEMU_TWEAK_GL_NATIVE_S3TC)) {
+                    unsigned int image_size = (physical_width / 4) *
+                                              (physical_height / 4) *
+                                              block_size;
+                    glCompressedTexImage2D(gl_target, level,
+                                           f.gl_internal_format,
+                                           width, height, 0,
+                                           image_size, texture_data);
+                    texture_data += image_size;
+                    width /= 2;
+                    height /= 2;
+                    continue;
+                }
+
                 uint8_t *converted = s3tc_decompress_2d(
                     gl_internal_format_to_s3tc_enum(f.gl_internal_format),
                     texture_data, width, height);
@@ -524,28 +581,47 @@ static void upload_gl_texture(GLenum gl_target,
                 uint8_t *unswizzled = (uint8_t*)g_malloc(height * pitch);
                 unswizzle_rect(texture_data, width, height,
                                unswizzled, pitch, f.bytes_per_pixel);
+                size_t converted_size = 0;
                 uint8_t *converted = pgraph_convert_texture_data(
                     s, unswizzled, palette_data, width, height, 1, pitch, 0,
-                    NULL);
+                    &converted_size);
                 uint8_t *pixel_data = converted ? converted : unswizzled;
                 unsigned int tex_width = width;
                 unsigned int tex_height = height;
+                GLint previous_unpack_alignment = 4;
+                bool cropped = s.cubemap && adjusted_width != s.width;
 
-                if (s.cubemap && adjusted_width != s.width) {
+                if (cropped) {
                     // FIXME: Consider preserving the border.
                     // There does not seem to be a way to reference the border
                     // texels in a cubemap, so they are discarded.
-                    glPixelStorei(GL_UNPACK_ROW_LENGTH, adjusted_width);
-                    tex_width = s.width;
-                    tex_height = s.height;
-                    pixel_data += 4 * f.bytes_per_pixel + 4 * pitch;
+                    PGRAPHTextureMipCrop crop =
+                        pgraph_bordered_texture_mip_crop(
+                            s.width, s.height, width, height, level);
+                    size_t upload_bytes_per_pixel = f.bytes_per_pixel;
+                    if (converted) {
+                        size_t pixels = (size_t)width * height;
+                        assert(pixels && converted_size >= pixels &&
+                               converted_size % pixels == 0);
+                        upload_bytes_per_pixel = converted_size / pixels;
+                    }
+                    glGetIntegerv(GL_UNPACK_ALIGNMENT,
+                                  &previous_unpack_alignment);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+                    tex_width = crop.width;
+                    tex_height = crop.height;
+                    pixel_data += ((size_t)crop.skip_rows * width +
+                                   crop.skip_pixels) * upload_bytes_per_pixel;
                 }
 
                 glTexImage2D(gl_target, level, f.gl_internal_format, tex_width,
                              tex_height, 0, f.gl_format, f.gl_type,
                              pixel_data);
-                if (s.cubemap && s.border) {
+                if (cropped) {
                     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT,
+                                  previous_unpack_alignment);
                 }
                 if (converted) {
                     g_free(converted);
@@ -682,34 +758,14 @@ static TextureBinding* generate_texture(const TextureShape s,
                    s.width, s.height, s.depth);
 
     if (gl_target == GL_TEXTURE_CUBE_MAP) {
-        unsigned int block_size;
-        if (f.gl_internal_format == GL_COMPRESSED_RGBA_S3TC_DXT1_EXT) {
-            block_size = 8;
-        } else {
-            block_size = 16;
+        size_t length;
+        if (!pgraph_calculate_texture_cubemap_face_stride(
+                &s, f.gl_format == 0, f.bytes_per_pixel, &length)) {
+            error_report("Invalid cubemap source layout");
+            glBindTexture(gl_target, 0);
+            glDeleteTextures(1, &gl_texture);
+            return NULL;
         }
-
-        size_t length = 0;
-        unsigned int w = s.width;
-        unsigned int h = s.height;
-        if (!f.linear && s.border) {
-            w = MAX(16, w * 2);
-            h = MAX(16, h * 2);
-        }
-
-        int level;
-        for (level = 0; level < s.levels; level++) {
-            if (f.gl_format == 0) {
-                length += w/4 * h/4 * block_size;
-            } else {
-                length += w * h * f.bytes_per_pixel;
-            }
-
-            w /= 2;
-            h /= 2;
-        }
-
-        length = (length + NV2A_CUBEMAP_FACE_ALIGNMENT - 1) & ~(NV2A_CUBEMAP_FACE_ALIGNMENT - 1);
 
         upload_gl_texture(GL_TEXTURE_CUBE_MAP_POSITIVE_X,
                           s, texture_data + 0 * length, palette_data);
@@ -747,6 +803,8 @@ static TextureBinding* generate_texture(const TextureShape s,
     ret->refcnt = 1;
     ret->draw_time = 0;
     ret->data_hash = 0;
+    ret->texture_vram_offset = 0;
+    ret->palette_vram_offset = 0;
     ret->min_filter = 0xFFFFFFFF;
     ret->mag_filter = 0xFFFFFFFF;
     ret->lod_bias = 0xFFFFFFFF;
@@ -755,17 +813,6 @@ static TextureBinding* generate_texture(const TextureShape s,
     ret->addrp = 0xFFFFFFFF;
     ret->border_color_set = false;
     return ret;
-}
-
-static void texture_binding_destroy(gpointer data)
-{
-    TextureBinding *binding = (TextureBinding *)data;
-    assert(binding->refcnt > 0);
-    binding->refcnt--;
-    if (binding->refcnt == 0) {
-        glDeleteTextures(1, &binding->gl_texture);
-        g_free(binding);
-    }
 }
 
 /* functions for texture LRU cache */
@@ -782,7 +829,7 @@ static void texture_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
     TextureLruNode *tnode = container_of(node, TextureLruNode, node);
     if (tnode->binding) {
-        texture_binding_destroy(tnode->binding);
+        pgraph_gl_texture_binding_destroy(tnode->binding);
         tnode->binding = NULL;
         tnode->possibly_dirty = false;
     }

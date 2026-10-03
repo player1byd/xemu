@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "performance_valid_for_pr_acceptance": false,
+  "timing_grade": "controlled_guest_timing_diagnostic",
+  "limits": [
+    "live guest markers unavailable; waiver active",
+    "two runs per role; some leaves drift materially",
+    "official upstream not included in this matched rerun",
+    "guest leaf time is not frame time or displayed FPS"
+  ],
+  "role_order": [
+    "main-1",
+    "candidate-1",
+    "candidate-2",
+    "main-2"
+  ],
+  "config_sha256": "9114631eb9acbe4fe4641bc3572b8465b993b4cdbfaa4485976f430c0a245d0e",
+  "settings": {
+    "backend": "Vulkan",
+    "surface_scale": 1,
+    "vsync": false,
+    "vk_ubershader_mode": "prewarm",
+    "vk_shader_fastpath": true,
+    "cache_shaders": true,
+    "validation": false,
+    "optional_host_telemetry": false
+  },
+  "source_sha": {
+    "main": "ef1a7fc4b62b033d4364f56c7c1822981935232a",
+    "candidate": "cd3c30b6025d4ca8d8bf114d689892873fc40a71"
+  },
+  "exe_sha256": {
+    "main": "f9fbc940e33994698ad43ea9c7ecf42790c0b3c53763c08f120a73fc3c485ffa",
+    "candidate": "f673bb0eb250e1e15ca9768a11a1ad5a06ae8f12d611cae9f7de0167edea0170"
+  },
+  "records_per_run": 157,
+  "passed_per_run": 157,
+  "leaf_count": 152,
+  "hash_matched_leaf_count": 150,
+  "hash_mismatch_leaf_ids": [
+    "game_load.s3tc_sync_factor.dxt1_same_address_queued",
+    "game_load.s3tc_sync_factor.rgba8_same_address_queued"
+  ],
+  "descriptive_leaf_counts": {
+    "candidate_faster": 54,
+    "candidate_slower": 95,
+    "equal": 1,
+    "pair_direction_repeated": 92,
+    "effect_exceeds_max_role_drift": 51
+  },
+  "descriptive_median_leaf_speedup_pct": -0.588,
+  "descriptive_geometric_mean_leaf_speedup_pct": -0.359,
+  "host_wall_seconds": {
+    "main-1": 91.17350070000975,
+    "candidate-1": 92.13855450000847,
+    "candidate-2": 91.13023900000553,
+    "main-2": 92.09431210000184
+  },
+  "process_cpu_seconds": {
+    "main-1": 194.5,
+    "candidate-1": 197.03125,
+    "candidate-2": 195.546875,
+    "main-2": 195.890625
+  },
+  "summed_guest_leaf_seconds": {
+    "main-1": 75.808274,
+    "candidate-1": 76.145279,
+    "candidate-2": 76.163682,
+    "main-2": 76.091618
+  },
+  "targeted_checks": {
+    "sampler_only_identity": {
+      "role_order": [
+        "target-main-1b",
+        "target-candidate-1",
+        "target-candidate-2",
+        "target-main-2"
+      ],
+      "guest_iterations": 80,
+      "guest_sample_count": 8,
+      "guest_average_us": [
+        35435,
+        37693,
+        36656,
+        35481
+      ],
+      "framebuffer_hash_match": true,
+      "pair1_candidate_speedup_pct": -5.991,
+      "pair2_candidate_speedup_pct": -3.205,
+      "two_pair_candidate_speedup_pct": -4.617
+    },
+    "cpu_sse_control": {
+      "role_order": [
+        "cpu-main-1",
+        "cpu-candidate-1",
+        "cpu-candidate-2",
+        "cpu-main-2"
+      ],
+      "guest_iterations": 100,
+      "guest_sample_count": 10,
+      "guest_average_us": [
+        506035,
+        509483,
+        515397,
+        508054
+      ],
+      "framebuffer_hash_match": true,
+      "pair1_candidate_speedup_pct": -0.677,
+      "pair2_candidate_speedup_pct": -1.425,
+      "two_pair_candidate_speedup_pct": -1.053
+    }
+  }
+}

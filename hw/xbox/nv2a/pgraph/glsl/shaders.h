@@ -36,5 +36,7 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg);
 
 bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
                                           const ShaderState *state);
+bool pgraph_glsl_nonregister_shader_state_changed(
+    PGRAPHState *pg, const ShaderState *state);
 
 #endif

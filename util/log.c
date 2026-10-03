@@ -523,6 +523,8 @@ const QEMULogItem qemu_log_items[] = {
       "include VPU registers in the 'cpu' logging" },
     { LOG_INVALID_MEM, "invalid_mem",
       "log invalid memory accesses" },
+    { LOG_NV2A, "nv2a",
+      "log detailed NV2A graphics diagnostics" },
     { 0, NULL, NULL },
 };
 

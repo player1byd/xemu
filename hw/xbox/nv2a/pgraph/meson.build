@@ -1,6 +1,8 @@
 specific_ss.add(files(
 	'pgraph.c',
 	'profile.c',
+	'renderer-switch.c',
+	'reports.c',
 	'rdi.c',
 	's3tc.c',
 	'swizzle.c',

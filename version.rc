@@ -17,6 +17,7 @@ FILESUBTYPE VFT2_UNKNOWN
       VALUE "CompanyName", "https://xemu.app"
       VALUE "FileDescription", "xemu: Original Xbox Emulator"
       VALUE "FileVersion", XEMU_VERSION
+      VALUE "ProductVersion", XEMU_VERSION
       VALUE "LegalCopyright", "Copyright various authors. Released under the GNU General Public License."
       VALUE "LegalTrademarks", "QEMU is a trademark of Fabrice Bellard."
       VALUE "ProductName", "xemu"

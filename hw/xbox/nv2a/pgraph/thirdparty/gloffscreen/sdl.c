@@ -95,5 +95,7 @@ void glo_context_destroy(GloContext *context)
 {
     if (!context) return;
     glo_set_current(NULL);
+    SDL_GL_DestroyContext(context->gl_context);
+    SDL_DestroyWindow(context->window);
     free(context);
 }

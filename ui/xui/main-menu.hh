@@ -145,6 +145,12 @@ public:
     void Draw() override;
 };
 
+class MainMenuAdvanceView : public virtual MainMenuTabView
+{
+public:
+    void Draw() override;
+};
+
 class MainMenuAboutView : public virtual MainMenuTabView
 {
 protected:
@@ -182,6 +188,7 @@ protected:
                                     m_network_button,
                                     m_snapshots_button,
                                     m_system_button,
+                                    m_advance_button,
                                     m_about_button;
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
@@ -191,6 +198,7 @@ protected:
     MainMenuNetworkView             m_network_view;
     MainMenuSnapshotsView           m_snapshots_view;
     MainMenuSystemView              m_system_view;
+    MainMenuAdvanceView             m_advance_view;
     MainMenuAboutView               m_about_view;
 
 

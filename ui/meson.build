@@ -22,10 +22,15 @@ subdir('thirdparty')
 xemu_ss = ss.source_set()
 xemu_ss.add(files(
   'xemu-input.c',
+  'xemu-input-topology.c',
   'xemu-monitor.c',
   'xemu-net.c',
   'xemu-settings.cc',
+  'xemu-settings-migration.cc',
+  'xemu-tweaks.c',
   'xemu-controllers.cc',
+  'xemu-gpu-launch.c',
+  'xemu-gpu-info.c',
 
   'xemu.c',
   'xemu-data.c',
@@ -35,7 +40,9 @@ xemu_ss.add(files(
 ))
 
 if host_os == 'windows'
-  xemu_ss.add(nvapi)
+  d3d11 = cc.find_library('d3d11', required: true)
+  dxgi = cc.find_library('dxgi', required: true)
+  xemu_ss.add(nvapi, d3d11, dxgi)
 endif
 
 subdir('xui')

@@ -143,7 +143,7 @@ LruNode *lru_evict_one(Lru *lru)
 }
 
 static inline
-LruNode *lru_get_one_free(Lru *lru)
+LruNode *lru_try_get_one_free(Lru *lru)
 {
 	LruNode *found;
 
@@ -153,7 +153,17 @@ LruNode *lru_get_one_free(Lru *lru)
 		}
 	}
 
-	return lru_evict_one(lru);
+	return lru_try_evict_one(lru);
+}
+
+static inline
+LruNode *lru_get_one_free(Lru *lru)
+{
+	LruNode *found = lru_try_get_one_free(lru);
+
+	assert(found != NULL); /* No free or evictable node! */
+
+	return found;
 }
 
 static inline
@@ -171,8 +181,43 @@ bool lru_contains_hash(Lru *lru, uint64_t hash)
 	return false;
 }
 
+/*
+ * Exact lookup without creation, eviction, or recency changes.
+ * The returned node is borrowed. Callers must provide synchronization and
+ * prevent concurrent mutation or eviction while using it.
+ */
 static inline
-LruNode *lru_lookup(Lru *lru, uint64_t hash, const void *key)
+LruNode *lru_find_existing(Lru *lru, uint64_t hash, const void *key)
+{
+    unsigned int bin = lru_hash_to_bin(lru, hash);
+    LruNode *iter;
+
+    QTAILQ_FOREACH(iter, &lru->bins[bin], next_bin) {
+        if (iter->hash == hash &&
+            !lru->compare_nodes(lru, iter, key)) {
+            return iter;
+        }
+    }
+
+    return NULL;
+}
+
+/* Refresh a borrowed exact hit while it remains in use under the caller's lock. */
+static inline
+void lru_touch_existing(Lru *lru, LruNode *node)
+{
+    unsigned int bin;
+
+    assert(lru_is_node_in_use(lru, node));
+    bin = lru_get_node_bin(lru, node);
+    QTAILQ_REMOVE(&lru->global, node, next_global);
+    QTAILQ_INSERT_HEAD(&lru->global, node, next_global);
+    QTAILQ_REMOVE(&lru->bins[bin], node, next_bin);
+    QTAILQ_INSERT_HEAD(&lru->bins[bin], node, next_bin);
+}
+
+static inline
+LruNode *lru_try_lookup(Lru *lru, uint64_t hash, const void *key)
 {
 	unsigned int bin = lru_hash_to_bin(lru, hash);
 	LruNode *iter, *found = NULL;
@@ -187,7 +232,10 @@ LruNode *lru_lookup(Lru *lru, uint64_t hash, const void *key)
 	if (found) {
 		QTAILQ_REMOVE(&lru->bins[bin], found, next_bin);
 	} else {
-		found = lru_get_one_free(lru);
+		found = lru_try_get_one_free(lru);
+		if (!found) {
+			return NULL;
+		}
 		found->hash = hash;
 		if (lru->init_node) {
 			lru->init_node(lru, found, key);
@@ -201,6 +249,16 @@ LruNode *lru_lookup(Lru *lru, uint64_t hash, const void *key)
 	QTAILQ_REMOVE(&lru->global, found, next_global);
 	QTAILQ_INSERT_HEAD(&lru->global, found, next_global);
 	QTAILQ_INSERT_HEAD(&lru->bins[bin], found, next_bin);
+
+	return found;
+}
+
+static inline
+LruNode *lru_lookup(Lru *lru, uint64_t hash, const void *key)
+{
+	LruNode *found = lru_try_lookup(lru, hash, key);
+
+	assert(found != NULL); /* No free or evictable node! */
 
 	return found;
 }
@@ -232,8 +290,8 @@ void lru_visit_active(Lru *lru, LruNodeVisitorFunc visitor_func, void *opaque)
 {
 	LruNode *iter, *iter_next;
 
-	for (unsigned int bin = 0; bin < LRU_NUM_BINS; bin++) {
-		QTAILQ_FOREACH_SAFE(iter, &lru->bins[bin], next_bin, iter_next) {
+	QTAILQ_FOREACH_SAFE(iter, &lru->global, next_global, iter_next) {
+		if (lru_is_node_in_use(lru, iter)) {
 			visitor_func(lru, iter, opaque);
 		}
 	}

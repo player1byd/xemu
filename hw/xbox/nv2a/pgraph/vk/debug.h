@@ -20,30 +20,41 @@
 #ifndef HW_XBOX_NV2A_PGRAPH_VK_DEBUG_H
 #define HW_XBOX_NV2A_PGRAPH_VK_DEBUG_H
 
-#define DEBUG_VK 0
+#include <stdbool.h>
 
 extern int nv2a_vk_dgroup_indent;
+extern bool nv2a_vk_text_debug_enabled;
 
-#define NV2A_VK_XDPRINTF(x, fmt, ...)                                  \
-    do {                                                               \
-        if (x) {                                                       \
-            fprintf(stderr, "%*s" fmt "\n", nv2a_vk_dgroup_indent, "", \
-                    ##__VA_ARGS__);                                    \
-        }                                                              \
+#ifdef __GNUC__
+__attribute__((format(gnu_printf, 1, 2)))
+#endif
+void pgraph_vk_text_debug_printf(const char *format, ...);
+
+#define NV2A_VK_DPRINTF(fmt, ...)                                       \
+    do {                                                                \
+        if (unlikely(nv2a_vk_text_debug_enabled)) {                     \
+            pgraph_vk_text_debug_printf(                                \
+                "%*s" fmt "\n", nv2a_vk_dgroup_indent, "",           \
+                ##__VA_ARGS__);                                         \
+        }                                                               \
     } while (0)
 
-#define NV2A_VK_DPRINTF(fmt, ...) NV2A_VK_XDPRINTF(DEBUG_VK, fmt, ##__VA_ARGS__)
+#define NV2A_VK_DGROUP_BEGIN(fmt, ...)                                  \
+    do {                                                                \
+        if (unlikely(nv2a_vk_text_debug_enabled)) {                     \
+            pgraph_vk_text_debug_printf(                                \
+                "%*s" fmt "\n", nv2a_vk_dgroup_indent, "",           \
+                ##__VA_ARGS__);                                         \
+            nv2a_vk_dgroup_indent++;                                    \
+        }                                                               \
+    } while (0)
 
-#define NV2A_VK_DGROUP_BEGIN(fmt, ...)                  \
+#define NV2A_VK_DGROUP_END(...)                         \
     do {                                                \
-        NV2A_VK_XDPRINTF(DEBUG_VK, fmt, ##__VA_ARGS__); \
-        nv2a_vk_dgroup_indent++;                        \
-    } while (0)
-
-#define NV2A_VK_DGROUP_END(...)             \
-    do {                                    \
-        nv2a_vk_dgroup_indent--;            \
-        assert(nv2a_vk_dgroup_indent >= 0); \
+        if (unlikely(nv2a_vk_text_debug_enabled)) {     \
+            nv2a_vk_dgroup_indent--;                    \
+            assert(nv2a_vk_dgroup_indent >= 0);         \
+        }                                               \
     } while (0)
 
 #define VK_CHECK(x)                                           \

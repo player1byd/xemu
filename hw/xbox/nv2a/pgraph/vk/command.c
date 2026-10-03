@@ -86,7 +86,9 @@ VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg)
     return r->aux_command_buffer;
 }
 
-void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
+void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd,
+                                        SingleTimeReason reason,
+                                        uint64_t staged_bytes)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
@@ -99,9 +101,22 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
     };
-    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+    int64_t submit_start = r->perf.enabled ?
+        qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
+    VkResult result = vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE);
+    uint64_t submit_cpu_us = r->perf.enabled ?
+        MAX(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - submit_start, 0) : 0;
+    VK_CHECK(result);
+    nv2a_profile_log_event_once(NV2A_PROFILE_EVENT_GPU_SUBMIT);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
-    VK_CHECK(vkQueueWaitIdle(r->queue));
+    int64_t wait_start = r->perf.enabled ?
+        qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
+    result = vkQueueWaitIdle(r->queue);
+    uint64_t wait_us = r->perf.enabled ?
+        MAX(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - wait_start, 0) : 0;
+    VK_CHECK(result);
+    pgraph_vk_perf_record_single_time_submit(
+        r, reason, submit_cpu_us, wait_us, staged_bytes);
 
     r->in_aux_command_buffer = false;
 }

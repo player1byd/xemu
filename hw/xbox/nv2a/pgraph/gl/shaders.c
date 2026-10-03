@@ -215,6 +215,7 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     memset(&key, 0, sizeof(key));
     key.kind = GL_FRAGMENT_SHADER;
     key.psh.state = state->psh;
+    pgraph_glsl_normalize_psh_state(&key.psh.state);
     glAttachShader(program, get_shader_module_for_key(r, &key));
 
     /* link the program */
@@ -833,6 +834,9 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
         glUseProgram(r->shader_binding->gl_program);
     }
 
+    // FIXME: Clear only the registers that are consumed by this binding.
+    pgraph_clear_dirty_reg_map(pg);
+
     NV2A_GL_DGROUP_END();
 
 update_uniforms:
@@ -843,6 +847,7 @@ update_uniforms:
 
 GLuint pgraph_gl_compile_shader(const char *vs_src, const char *fs_src)
 {
+    nv2a_profile_log_event_once(NV2A_PROFILE_EVENT_SHADER_COMPILE);
     GLint status;
     char err_buf[512];
 

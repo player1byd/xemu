@@ -46,7 +46,9 @@ void update_output(USBXIDGamepadState *s)
     }
 
     ControllerState *state = xemu_input_get_bound(s->device_index);
-    assert(state);
+    if (!state) {
+        return;
+    }
     state->rumble_l = s->out_state.left_actuator_strength;
     state->rumble_r = s->out_state.right_actuator_strength;
     xemu_input_update_rumble(state);
@@ -54,13 +56,17 @@ void update_output(USBXIDGamepadState *s)
 
 void update_input(USBXIDGamepadState *s)
 {
+    ControllerState *state = xemu_input_get_bound(s->device_index);
+    if (!state) {
+        /* The emulated device remains present without a host provider. */
+        xid_gamepad_report_neutral(&s->in_state);
+        return;
+    }
     if (xemu_input_get_test_mode()) {
         // Don't report changes if we are testing the controller while running
         return;
     }
 
-    ControllerState *state = xemu_input_get_bound(s->device_index);
-    assert(state);
     xemu_input_update_controller(state);
 
     const int button_map_analog[6][2] = {

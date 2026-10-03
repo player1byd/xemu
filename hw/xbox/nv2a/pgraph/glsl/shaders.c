@@ -18,6 +18,7 @@
  */
 
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "ui/xemu-tweaks.h"
 #include "shaders.h"
 
 ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
@@ -34,6 +35,28 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
     pgraph_glsl_set_psh_state(pg, &state.psh);
 
     return state;
+}
+
+bool pgraph_glsl_nonregister_shader_state_changed(
+    PGRAPHState *pg, const ShaderState *state)
+{
+    if (pg->uniform_attrs != state->vsh.uniform_attrs ||
+        pg->swizzle_attrs != state->vsh.swizzle_attrs ||
+        pg->compressed_attrs != state->vsh.compressed_attrs ||
+        pg->primitive_mode != state->geom.primitive_mode ||
+        pg->surface_scale_factor != state->vsh.surface_scale_factor ||
+        pg->surface_shape.zeta_format != state->psh.surface_zeta_format ||
+        xemu_tweak_enabled(XEMU_TWEAK_NV20_VERTEX_ARITHMETIC) !=
+            state->vsh.nv20_vertex_arithmetic) {
+        return true;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (pg->texture_matrix_enable[i] !=
+            state->vsh.fixed_function.texture_matrix_enable[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
@@ -69,12 +92,7 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
         }
     }
 
-    if (pg->uniform_attrs != state->vsh.uniform_attrs ||
-        pg->swizzle_attrs != state->vsh.swizzle_attrs ||
-        pg->compressed_attrs != state->vsh.compressed_attrs ||
-        pg->primitive_mode != state->geom.primitive_mode ||
-        pg->surface_scale_factor != state->vsh.surface_scale_factor ||
-        pg->surface_shape.zeta_format != state->psh.surface_zeta_format) {
+    if (pgraph_glsl_nonregister_shader_state_changed(pg, state)) {
         return true;
     }
 
@@ -82,11 +100,6 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
         if (pgraph_is_reg_dirty(pg, NV_PGRAPH_TEXCTL0_0 + i * 4) ||
             pgraph_is_reg_dirty(pg, NV_PGRAPH_TEXFILTER0 + i * 4) ||
             pgraph_is_reg_dirty(pg, NV_PGRAPH_TEXFMT0 + i * 4)) {
-            return true;
-        }
-
-        if (pg->texture_matrix_enable[i] !=
-            state->vsh.fixed_function.texture_matrix_enable[i]) {
             return true;
         }
     }

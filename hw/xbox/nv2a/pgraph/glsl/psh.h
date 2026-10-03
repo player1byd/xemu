@@ -75,6 +75,9 @@ typedef struct PshState {
 } PshState;
 
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
+void pgraph_glsl_normalize_psh_state(PshState *state);
+void pgraph_glsl_get_psh_combiner_constants(PGRAPHState *pg,
+                                             float constants[18][4]);
 
 #define PSH_UNIFORM_DECL_X(S, DECL) \
     DECL(S, alphaRef, int, 1)       \
@@ -98,6 +101,8 @@ typedef struct GenPshGlslOptions {
     bool vulkan;
     int ubo_binding;
     int tex_binding;
+    bool ubershader;
+    int uber_binding;
 } GenPshGlslOptions;
 
 MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts);

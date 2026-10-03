@@ -32,6 +32,8 @@
 #include "xemu-settings.h"
 #include <SDL3/SDL.h>
 
+typedef struct Error Error;
+
 #define DRIVER_DUKE "usb-xbox-gamepad"
 #define DRIVER_S "usb-xbox-gamepad-s"
 
@@ -104,18 +106,89 @@ typedef struct ControllerState {
     SDL_JoystickID      sdl_joystick_id;
     SDL_GUID            sdl_joystick_guid;
 
-    enum peripheral_type peripheral_types[2];
-    void *peripherals[2];
-
     GamepadMappings *controller_map;
 
     int   bound;  // Which port this input device is bound to
-    void *device; // DeviceState opaque
 } ControllerState;
+
+/* Guest USB topology and expansion devices outlive a host input provider. */
+typedef struct XemuVirtualControllerPort {
+    bool connected;
+    ControllerState *provider;
+    void *hub;     // DeviceState opaque
+    void *gamepad; // DeviceState opaque
+    enum peripheral_type peripheral_types[2];
+    void *peripherals[2];
+} XemuVirtualControllerPort;
+
+typedef struct XemuInputTopologyOps {
+    void *(*create_hub)(void *opaque, Error **errp);
+    void *(*create_gamepad)(void *opaque, Error **errp);
+    bool (*remove_hub)(void *opaque, void *hub, Error **errp);
+    void (*release_device)(void *device);
+} XemuInputTopologyOps;
+
+bool xemu_input_create_virtual_devices(XemuVirtualControllerPort *port,
+                                       const XemuInputTopologyOps *ops,
+                                       void *opaque, Error **errp);
+
+typedef struct XemuInputXmuOps {
+    void *(*create_drive)(void *opaque, Error **errp);
+    void *(*create_device)(void *opaque, void *drive, Error **errp);
+    void (*remove_drive)(void *opaque, void *drive);
+} XemuInputXmuOps;
+
+bool xemu_input_create_xmu_device(const XemuInputXmuOps *ops, void *opaque,
+                                  void **device, Error **errp);
+
+/* Host assignment never changes guest USB or expansion ownership. */
+static inline ControllerState *xemu_input_port_assign_provider(
+    XemuVirtualControllerPort *port, ControllerState *provider, int index)
+{
+    ControllerState *previous = port->provider;
+    if (previous) {
+        previous->bound = -1;
+    }
+    port->provider = provider;
+    if (provider) {
+        provider->bound = index;
+    }
+    return previous;
+}
+
+static inline bool xemu_input_port_should_exist(int setting,
+                                                 const char *legacy_guid)
+{
+    return setting == 1 ||
+           (setting < 0 && legacy_guid && legacy_guid[0]);
+}
+
+static inline int xemu_input_normalize_virtual_presence(int setting)
+{
+    return setting == 0 || setting == 1 ? setting : -1;
+}
+
+typedef struct XemuInputProviderPreference {
+    const char *identifier;
+    bool write_identifier;
+    bool write_presence;
+    int presence;
+} XemuInputProviderPreference;
+
+static inline XemuInputProviderPreference xemu_input_provider_preference(
+    bool save, bool virtual_controller_connected, const char *identifier)
+{
+    XemuInputProviderPreference preference;
+    preference.identifier = identifier ? identifier : "";
+    preference.write_identifier = save;
+    preference.write_presence = save && virtual_controller_connected;
+    preference.presence = 1;
+    return preference;
+}
 
 typedef QTAILQ_HEAD(, ControllerState) ControllerStateList;
 extern ControllerStateList available_controllers;
-extern ControllerState *bound_controllers[4];
+extern XemuVirtualControllerPort virtual_controllers[4];
 extern const char *bound_drivers[4];
 
 #ifdef __cplusplus
@@ -125,18 +198,22 @@ extern "C" {
 extern int *g_keyboard_scancode_map[25];
 
 void xemu_input_init(void);
-void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
+void xemu_input_process_sdl_events(const SDL_Event *event);
 void xemu_input_update_controllers(void);
 void xemu_input_update_controller(ControllerState *state);
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);
 void xemu_input_update_sdl_controller_state(ControllerState *state);
 void xemu_input_update_rumble(ControllerState *state);
 ControllerState *xemu_input_get_bound(int index);
-void xemu_input_bind(int index, ControllerState *state, int save);
+/* Guest topology and provider mutation functions require the BQL. */
+bool xemu_input_set_provider(int index, ControllerState *state, int save);
+bool xemu_input_virtual_connect(int index, const char *driver, int save);
+bool xemu_input_virtual_disconnect(int index, int save);
+bool xemu_input_set_virtual_model(int index, const char *driver, int save);
 bool xemu_input_bind_xmu(int player_index, int peripheral_port_index,
                          const char *filename, bool is_rebind);
 void xemu_input_rebind_xmu(int port);
-void xemu_input_unbind_xmu(int player_index, int peripheral_port_index);
+bool xemu_input_unbind_xmu(int player_index, int peripheral_port_index);
 int xemu_input_get_controller_default_bind_port(ControllerState *state, int start);
 void xemu_save_peripheral_settings(int player_index, int peripheral_index,
                                    int peripheral_type,

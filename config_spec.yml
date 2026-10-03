@@ -1,3 +1,42 @@
+tweaks:
+  cpu_saving_wait:
+    type: bool
+    default: true
+  pgraph_bulk_packets:
+    type: bool
+    default: true
+  pgraph_fence_fastpath:
+    type: bool
+    default: true
+  vk_color_download_folding:
+    type: bool
+    default: true
+  vk_bounded_vertex_uploads:
+    type: bool
+    default: true
+  vk_vertex_copy_shortcuts:
+    type: bool
+    default: true
+  vk_transient_buffer_growth:
+    type: bool
+    default: true
+  vk_hybrid_ubershaders:
+    type: bool
+    default: false
+  vk_ubershader_mode:
+    type: enum
+    values: ["off", fallback, prewarm, always]
+    default: prewarm
+  vk_shader_fastpath:
+    type: bool
+    default: true
+  nv20_vertex_arithmetic:
+    type: bool
+    default: false
+  gl_native_s3tc:
+    type: bool
+    default: true
+
 general:
   show_welcome:
     type: bool
@@ -21,6 +60,20 @@ general:
     filter_current_game: bool
 
 input:
+  # -1 migrates legacy GUID/model settings; 0 and 1 are explicit guest topology.
+  virtual_ports:
+    port1_connected:
+      type: integer
+      default: -1
+    port2_connected:
+      type: integer
+      default: -1
+    port3_connected:
+      type: integer
+      default: -1
+    port4_connected:
+      type: integer
+      default: -1
   bindings:
     port1_driver: string
     port1: string
@@ -233,6 +286,7 @@ display:
     debug_shaders: bool
     assert_on_validation_msg: bool
     preferred_physical_device: string
+    device_uuid: string
   quality:
     surface_scale:
       type: integer

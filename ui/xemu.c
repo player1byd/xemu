@@ -44,7 +44,10 @@
 #include "system/system.h"
 #include "xui/xemu-hud.h"
 #include "xemu-input.h"
+#include "xemu-gpu-info.h"
+#include "xemu-gpu-launch.h"
 #include "xemu-settings.h"
+#include "xemu-tweaks.h"
 #include "xemu-snapshots.h"
 #include "xemu-version.h"
 #include "xemu-os-utils.h"
@@ -53,12 +56,19 @@
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+#ifdef CONFIG_VULKAN
+#include "hw/xbox/nv2a/pgraph/vk/device-inventory.h"
+#endif
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+
+#ifdef _WIN32
+#include "xui/win32-dxgi-present.h"
+#endif
 
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
@@ -528,8 +538,30 @@ static void handle_windowevent(SDL_Event *ev)
                 g_config.display.window.last_width = ev->window.data1;
                 g_config.display.window.last_height = ev->window.data2;
             }
+
+#ifdef _WIN32
+            if (win32_dxgi_present_is_active()) {
+                int width;
+                int height;
+                if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
+                                               &height)) {
+                    fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
+                                    "responding to resize event.\n");
+                } else {
+                    win32_dxgi_present_resize(width, height);
+                }
+            }
+#endif
         }
         break;
+#ifdef _WIN32
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        if (win32_dxgi_present_is_active()) {
+            win32_dxgi_present_resize(ev->window.data1, ev->window.data2);
+        }
+        break;
+#endif
+
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
         if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
@@ -811,6 +843,9 @@ static void gl_render_frame(struct xemu_console *scon)
 
     bool flip_required = false;
     bool release_surface_texture = false;
+#ifdef _WIN32
+    XemuWin32PresentRoute present_route;
+#endif
 
     /* XXX: Note that this bypasses the usual VGA path in order to quickly
      * get the surface. This is simple and fast, at the cost of accuracy.
@@ -836,6 +871,11 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_main_loop_unlock();
     }
 
+#ifdef _WIN32
+    present_route = win32_dxgi_present_prepare_frame(
+        scon->real_window, g_config.display.window.vsync);
+#endif
+
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     xemu_snapshots_set_framebuffer_texture(tex, flip_required);
@@ -860,7 +900,16 @@ static void gl_render_frame(struct xemu_console *scon)
     }
 
     nv2a_release_framebuffer_surface();
+
+#ifdef _WIN32
+    present_route = win32_dxgi_present_finish_frame(
+        scon->real_window, present_route, g_config.display.window.vsync);
+    if (present_route == XEMU_WIN32_PRESENT_SDL) {
+        SDL_GL_SwapWindow(scon->real_window);
+    }
+#else
     SDL_GL_SwapWindow(scon->real_window);
+#endif
     assert(glGetError() == GL_NO_ERROR);
 
     qatomic_set(&rendering, false);
@@ -874,8 +923,22 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
     struct xemu_console *scon = (struct xemu_console *)userdata;
 
-    if (event->type == SDL_EVENT_WINDOW_EXPOSED ||
-        event->type == SDL_EVENT_WINDOW_RESIZED) {
+    if (event->type == SDL_EVENT_WINDOW_RESIZED) {
+#ifdef _WIN32
+        if (win32_dxgi_present_is_active()) {
+            int width;
+            int height;
+            if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
+                                           &height)) {
+                fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
+                                "responding to resize event.\n");
+            } else {
+                win32_dxgi_present_resize(width, height);
+            }
+        }
+#endif
+        gl_render_frame(scon);
+    } else if (event->type == SDL_EVENT_WINDOW_EXPOSED) {
         gl_render_frame(scon);
     }
 
@@ -1177,6 +1240,9 @@ static void display_finalize(void)
     }
 
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
+#ifdef _WIN32
+    win32_dxgi_present_cleanup();
+#endif
     SDL_GL_MakeCurrent(NULL, NULL);
     SDL_GL_DestroyContext(m_context);
     SDL_DestroyWindow(m_window);
@@ -1272,6 +1338,64 @@ static void init_sdl_app_metadata(void)
                                "https://xemu.app");
 }
 
+static int run_gpu_inventory_only(const XemuGpuLaunchRequest *request)
+{
+#ifdef CONFIG_VULKAN
+    g_autofree PGRAPHVkDeviceRecord *devices = NULL;
+    size_t count = 0;
+    Error *error = NULL;
+    if (!pgraph_vk_probe_device_inventory(&devices, &count, &error)) {
+        const char *message = error ? error_get_pretty(error) :
+                                      "unknown error";
+        fprintf(stderr, "GPU inventory failed: %s\n",
+                message);
+        xemu_gpu_info_record_failure(NULL, message, false, NULL);
+        error_free(error);
+        return 1;
+    }
+
+    printf("Vulkan adapters (%zu):\n", count);
+    for (size_t i = 0; i < count; i++) {
+        char uuid[PGRAPH_VK_DEVICE_UUID_STRING_SIZE];
+        pgraph_vk_device_uuid_format(devices[i].device_uuid, uuid);
+        printf("%zu: %s\n"
+               "    uuid: %s\n"
+               "    vendor: 0x%04x device: 0x%04x\n"
+               "    renderer: %s%s%s\n",
+               i, devices[i].name, uuid, devices[i].vendor_id,
+               devices[i].device_id,
+               devices[i].renderer_supported ? "compatible" : "unsupported",
+               devices[i].rejection_reason ? " - " : "",
+               devices[i].rejection_reason ?: "");
+    }
+
+    if (request->info_path != NULL) {
+        XemuGpuInfoDocument document = {
+            .state = XEMU_GPU_INFO_INVENTORY,
+            .request = request,
+            .devices = devices,
+            .device_count = count,
+            .requested_backend = "Vulkan",
+            .presentation_mode = XEMU_GPU_PRESENTATION_UNKNOWN,
+        };
+        g_autofree char *json = xemu_gpu_info_render_json(&document);
+        char file_error[512] = { 0 };
+        if (json == NULL ||
+            !xemu_gpu_info_write_atomic(request->info_path, json,
+                                        file_error, sizeof(file_error))) {
+            fprintf(stderr, "GPU inventory output failed: %s\n",
+                    json == NULL ? "could not allocate JSON document" :
+                                   file_error);
+            return 1;
+        }
+    }
+    return 0;
+#else
+    fprintf(stderr, "GPU inventory unavailable: Vulkan is not compiled in\n");
+    return 1;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     QemuThread thread;
@@ -1306,10 +1430,24 @@ int main(int argc, char **argv)
     fprintf(stderr, "xemu_commit: %s\n", xemu_commit);
     fprintf(stderr, "xemu_date: %s\n", xemu_date);
 
-    init_sdl_app_metadata();
-
     gArgc = argc;
     gArgv = argv;
+
+    XemuGpuLaunchRequest gpu_request;
+    xemu_gpu_launch_request_init(&gpu_request);
+    XemuGpuLaunchParseStatus gpu_parse_status =
+        xemu_gpu_launch_parse_early(argc, argv, &gpu_request);
+    if (gpu_parse_status != XEMU_GPU_LAUNCH_PARSE_OK) {
+        fprintf(stderr, "Invalid GPU option: %s\n",
+                xemu_gpu_launch_parse_status_string(gpu_parse_status));
+        return 2;
+    }
+    xemu_gpu_launch_request_set_current(&gpu_request);
+    if (gpu_request.list_gpus) {
+        return run_gpu_inventory_only(&gpu_request);
+    }
+
+    init_sdl_app_metadata();
 
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
@@ -1331,6 +1469,18 @@ int main(int argc, char **argv)
         SDL_Quit();
         exit(1);
     }
+
+    gpu_parse_status = xemu_gpu_launch_apply_saved(
+        &gpu_request, g_config.display.vulkan.device_uuid,
+        g_config.display.vulkan.preferred_physical_device);
+    if (gpu_parse_status != XEMU_GPU_LAUNCH_PARSE_OK) {
+        fprintf(stderr, "Invalid saved GPU selection: %s\n",
+                xemu_gpu_launch_parse_status_string(gpu_parse_status));
+        SDL_Quit();
+        return 2;
+    }
+    xemu_gpu_launch_request_set_current(&gpu_request);
+    xemu_tweaks_apply(true);
     atexit(xemu_settings_save);
 
 #ifdef _WIN32

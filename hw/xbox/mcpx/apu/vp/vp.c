@@ -21,6 +21,7 @@
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
+#include "resample.h"
 
 static const struct {
     hwaddr top, current, next;
@@ -51,14 +52,19 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
     d->set_irq = true;
 }
 
+static void voice_destroy_resampler(MCPXAPUVoiceFilter *filter)
+{
+    mcpx_apu_resampler_destroy(&filter->resampler,
+                               &filter->resampler_channels);
+}
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
-    if (d->vp.filters[v].resampler) {
-        src_reset(d->vp.filters[v].resampler);
-    }
+    /* VOICE_ON starts a new stream, so select its channel layout afresh. */
+    voice_destroy_resampler(&d->vp.filters[v]);
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -1140,28 +1146,48 @@ static long voice_resample_callback(void *cb_data, float **data)
         if (count < 0) {
             break;
         }
+        if (filter->resampler_channels == 1) {
+            mcpx_apu_pack_mono_samples(
+                (const float(*)[2]) &filter->resample_buf[2 * sample_count],
+                &filter->mono_resample_buf[sample_count], count);
+        }
         sample_count += count;
     }
 
     if (sample_count < NUM_SAMPLES_PER_FRAME) {
         /* Starvation causes SRC hang on repeated calls. Provide silence. */
-        memset(&filter->resample_buf[2*sample_count], 0,
-            2*(NUM_SAMPLES_PER_FRAME-sample_count)*sizeof(float));
+        if (filter->resampler_channels == 1) {
+            memset(&filter->mono_resample_buf[sample_count], 0,
+                   (NUM_SAMPLES_PER_FRAME - sample_count) * sizeof(float));
+        } else {
+            memset(&filter->resample_buf[2 * sample_count], 0,
+                   2 * (NUM_SAMPLES_PER_FRAME - sample_count) * sizeof(float));
+        }
         sample_count = NUM_SAMPLES_PER_FRAME;
     }
 
-    *data = filter->resample_buf;
+    *data = filter->resampler_channels == 1 ? filter->mono_resample_buf
+                                            : filter->resample_buf;
     return sample_count;
 }
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
-                          int requested_num, float rate)
+                          int requested_num, float rate, bool stereo)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    assert(requested_num > 0);
+    assert(requested_num <= NUM_SAMPLES_PER_FRAME);
     MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    int channels = stereo ? 2 : 1;
+
+    if (filter->resampler != NULL &&
+        filter->resampler_channels != channels) {
+        voice_destroy_resampler(filter);
+    }
 
     if (filter->resampler == NULL) {
         filter->voice = v;
+        filter->resampler_channels = channels;
         int err;
 
         /* Note: Using a sinc based resampler for quality. Unsure about
@@ -1169,28 +1195,39 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
          * which case using this resampler is overkill, but quality is good
          * so use it for now.
          */
-        // FIXME: Don't do 2ch resampling if this is a mono voice
         filter->resampler = src_callback_new(&voice_resample_callback,
-                                           SRC_SINC_FASTEST, 2, &err, filter);
+                                             SRC_SINC_FASTEST, channels, &err,
+                                             filter);
         if (filter->resampler == NULL) {
             fprintf(stderr, "src error: %s\n", src_strerror(err));
-            assert(0);
+            return -1;
         }
     }
 
-    int count = src_callback_read(filter->resampler, rate, requested_num,
-                                  (float *)samples);
-    if (count == -1) {
-        DPRINTF("resample error\n");
+    float mono_samples[NUM_SAMPLES_PER_FRAME];
+    float *output = stereo ? (float *)samples : mono_samples;
+    long count = src_callback_read(filter->resampler, rate, requested_num,
+                                   output);
+    if (count != requested_num) {
+        int err = src_error(filter->resampler);
+
+        if (err != 0) {
+            DPRINTF("src_callback_read: %s\n", src_strerror(err));
+            return -1;
+        }
+        if (count == 0) {
+            return -1;
+        }
     }
     if (count != requested_num) {
-        DPRINTF("resample returned fewer than expected: %d\n", count);
-
-        if (count == 0)
-            return -1;
+        DPRINTF("resample returned fewer than expected: %ld\n", count);
     }
 
-    return count;
+    if (!stereo) {
+        mcpx_apu_expand_mono_samples(mono_samples, samples, (int)count);
+    }
+
+    return (int)count;
 }
 
 static int peek_ahead_multipass_bin(MCPXAPUState *d, uint16_t v,
@@ -1345,7 +1382,8 @@ static void voice_process(MCPXAPUState *d,
             }
             int count =
                 voice_resample(d, v, &samples[sample_count],
-                               NUM_SAMPLES_PER_FRAME - sample_count, rate);
+                               NUM_SAMPLES_PER_FRAME - sample_count, rate,
+                               stereo);
             if (count < 0) {
                 break;
             }
@@ -1640,6 +1678,7 @@ static void *voice_worker_thread(void *arg)
         qemu_cond_wait(&vwd->work_pending, &vwd->lock);
     } while (!vwd->workers_should_exit);
 
+    qemu_mutex_unlock(&vwd->lock);
     rcu_unregister_thread();
     return NULL;
 }
@@ -1865,6 +1904,9 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
 {
     voice_work_finalize(d);
+    for (int v = 0; v < ARRAY_SIZE(d->vp.filters); v++) {
+        voice_destroy_resampler(&d->vp.filters[v]);
+    }
 }
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)
@@ -1876,6 +1918,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < ARRAY_SIZE(d->vp.filters); v++) {
+        voice_destroy_resampler(&d->vp.filters[v]);
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }
 }

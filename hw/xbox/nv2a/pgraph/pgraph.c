@@ -22,8 +22,15 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/log.h"
+#include "ui/xemu-gpu-info.h"
+#include "ui/xemu-gpu-launch.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
+#include "ui/xemu-tweaks.h"
+#include "inline-elements.h"
+#include "renderer-switch.h"
+#include "texture-state.h"
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
@@ -39,21 +46,127 @@
 
 NV2AState *g_nv2a;
 
+/* IRQ state is owned by the BQL, independently of renderer state. The FIFO
+ * worker drops pg->lock before publishing an interrupt under the BQL. */
+static bool pgraph_control_read(PGRAPHState *pg, hwaddr addr, uint64_t *value)
+{
+    switch (addr) {
+    case NV_PGRAPH_INTR:
+        assert(bql_locked());
+        *value = qatomic_read(&pg->pending_interrupts);
+        return true;
+    case NV_PGRAPH_INTR_EN:
+        assert(bql_locked());
+        *value = pg->enabled_interrupts;
+        return true;
+    case NV_PGRAPH_INCREMENT:
+        assert(bql_locked());
+        *value = pg->regs_[NV_PGRAPH_INCREMENT];
+        return true;
+    case NV_PGRAPH_SURFACE:
+        *value = pgraph_reg_r(pg, NV_PGRAPH_SURFACE);
+        return true;
+    case NV_PGRAPH_FIFO:
+        *value = qatomic_read(&pg->regs_[NV_PGRAPH_FIFO]);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool pgraph_control_write(NV2AState *d, hwaddr addr, uint32_t value)
+{
+    PGRAPHState *pg = &d->pgraph;
+    if (addr != NV_PGRAPH_INTR && addr != NV_PGRAPH_INTR_EN &&
+        addr != NV_PGRAPH_FIFO && addr != NV_PGRAPH_INCREMENT &&
+        addr != NV_PGRAPH_SURFACE) {
+        return false;
+    }
+    assert(bql_locked());
+    if (addr == NV_PGRAPH_INTR_EN) {
+        pg->enabled_interrupts = value;
+        nv2a_update_irq(d);
+        return true;
+    }
+    int64_t flip_time = -1;
+    qemu_mutex_lock(&d->pfifo.lock);
+    switch (addr) {
+    case NV_PGRAPH_INTR: {
+        uint32_t pending = qatomic_read(&pg->pending_interrupts) & ~value;
+        qatomic_set(&pg->pending_interrupts, pending);
+        if (!(pending & NV_PGRAPH_INTR_ERROR)) {
+            qatomic_set(&pg->waiting_for_nop, false);
+        }
+        if (!(pending & NV_PGRAPH_INTR_CONTEXT_SWITCH)) {
+            qatomic_set(&pg->waiting_for_context_switch, false);
+        }
+        nv2a_update_irq(d);
+        pfifo_kick(d);
+        break;
+    }
+    case NV_PGRAPH_SURFACE:
+        pgraph_reg_w(pg, NV_PGRAPH_SURFACE, value);
+        pfifo_kick(d);
+        break;
+    case NV_PGRAPH_INCREMENT:
+        if (value & NV_PGRAPH_INCREMENT_READ_3D) {
+            pgraph_flip_increment(pg, NV_PGRAPH_SURFACE_READ_3D);
+            flip_time = nv2a_profile_increment();
+            pfifo_kick(d);
+        }
+        break;
+    case NV_PGRAPH_FIFO:
+        /* Access control has no draw/shader state. Do not mutate the draw
+         * dirty bitmap from a concurrent MMIO writer. */
+        qatomic_set(&pg->regs_[NV_PGRAPH_FIFO], value);
+        pfifo_kick(d);
+        break;
+    }
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (flip_time >= 0) {
+        nv2a_profile_log_increment(flip_time);
+    }
+    return true;
+}
+
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
 
+    uint64_t control_value;
+    if (pgraph_control_read(pg, addr, &control_value)) {
+        nv2a_reg_log_read(NV_PGRAPH, addr, size, control_value);
+        return control_value;
+    }
+
+    /*
+     * Lock-free fast path for the GPU fence register the guest busy-polls.
+     * The Xbox D3D runtime polls NV_PGRAPH_PATT_COLOR0 for its fence value;
+     * taking pg->lock for each poll convoys with the FIFO puller, which
+     * needs the same lock to advance the fence being polled for. A
+     * momentarily stale read is what real hardware gives a CPU polling an
+     * asynchronously updated register. The write side is serialized: the
+     * fence method runs under pg->lock, and guest MMIO writes to this
+     * register are issued by the same single vCPU that polls it.
+     */
+    if (addr == NV_PGRAPH_PATT_COLOR0 && size == 4 &&
+        xemu_tweak_enabled(XEMU_TWEAK_PGRAPH_FENCE_FASTPATH)) {
+        uint64_t fr = qatomic_read(&pg->regs_[NV_PGRAPH_PATT_COLOR0]);
+        /*
+         * Pairs with the smp_wmb at the fence write site in pgraph_method,
+         * so that the pgraph effects preceding the fence are visible once
+         * the new fence value is.
+         */
+        smp_rmb();
+        nv2a_reg_log_read(NV_PGRAPH, addr, size, fr);
+        return fr;
+    }
+
     qemu_mutex_lock(&pg->lock);
 
     uint64_t r = 0;
     switch (addr) {
-    case NV_PGRAPH_INTR:
-        r = pg->pending_interrupts;
-        break;
-    case NV_PGRAPH_INTR_EN:
-        r = pg->enabled_interrupts;
-        break;
     case NV_PGRAPH_RDI_DATA: {
         unsigned int select = PG_GET_MASK(NV_PGRAPH_RDI_INDEX,
                                        NV_PGRAPH_RDI_INDEX_SELECT);
@@ -87,36 +200,14 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
 
+    if (pgraph_control_write(d, addr, val)) {
+        return;
+    }
+
     qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
     qemu_mutex_lock(&pg->lock);
 
     switch (addr) {
-    case NV_PGRAPH_INTR:
-        pg->pending_interrupts &= ~val;
-
-        if (!(pg->pending_interrupts & NV_PGRAPH_INTR_ERROR)) {
-            pg->waiting_for_nop = false;
-        }
-        if (!(pg->pending_interrupts & NV_PGRAPH_INTR_CONTEXT_SWITCH)) {
-            pg->waiting_for_context_switch = false;
-        }
-        pfifo_kick(d);
-        break;
-    case NV_PGRAPH_INTR_EN:
-        pg->enabled_interrupts = val;
-        break;
-    case NV_PGRAPH_INCREMENT:
-        if (val & NV_PGRAPH_INCREMENT_READ_3D) {
-            PG_SET_MASK(NV_PGRAPH_SURFACE,
-                     NV_PGRAPH_SURFACE_READ_3D,
-                     (PG_GET_MASK(NV_PGRAPH_SURFACE,
-                              NV_PGRAPH_SURFACE_READ_3D)+1)
-                        % PG_GET_MASK(NV_PGRAPH_SURFACE,
-                                   NV_PGRAPH_SURFACE_MODULO_3D) );
-            nv2a_profile_increment();
-            pfifo_kick(d);
-        }
-        break;
     case NV_PGRAPH_RDI_DATA: {
         unsigned int select = PG_GET_MASK(NV_PGRAPH_RDI_INDEX,
                                        NV_PGRAPH_RDI_INDEX_SELECT);
@@ -166,13 +257,6 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         break;
     }
 
-    // events
-    switch (addr) {
-    case NV_PGRAPH_FIFO:
-        pfifo_kick(d);
-        break;
-    }
-
     qemu_mutex_unlock(&pg->lock);
     qemu_mutex_unlock(&d->pfifo.lock);
 }
@@ -197,10 +281,10 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
         assert(!PG_GET_MASK(NV_PGRAPH_DEBUG_3,
                             NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH));
 
-        pg->waiting_for_context_switch = true;
         qemu_mutex_unlock(&pg->lock);
         bql_lock();
-        pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
+        qatomic_set(&pg->waiting_for_context_switch, true);
+        qatomic_or(&pg->pending_interrupts, NV_PGRAPH_INTR_CONTEXT_SWITCH);
         nv2a_update_irq(d);
         bql_unlock();
         qemu_mutex_lock(&pg->lock);
@@ -225,11 +309,15 @@ void pgraph_init(NV2AState *d)
     qemu_event_init(&pg->sync_complete, false);
     qemu_event_init(&pg->flush_complete, false);
     qemu_cond_init(&pg->framebuffer_released);
+    qemu_event_init(&pg->renderer_switch_progress, false);
     qemu_event_init(&pg->renderer_switch_complete, false);
+    pg->renderer_switch_handoff_pending = 0;
     pg->renderer_switch_phase = PGRAPH_RENDERER_SWITCH_PHASE_IDLE;
 
     pg->frame_time = 0;
     pg->draw_time = 0;
+    memset(&pg->uniform_source_epochs, 0,
+           sizeof(pg->uniform_source_epochs));
 
     pg->material_alpha = 0.0f;
     PG_SET_MASK(NV_PGRAPH_CONTROL_3, NV_PGRAPH_CONTROL_3_SHADEMODE,
@@ -249,6 +337,7 @@ void pgraph_init(NV2AState *d)
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
 {
     memset(pg->regs_dirty, 0, sizeof(pg->regs_dirty));
+    pg->regs_written_since_draw = false;
 }
 
 static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
@@ -270,6 +359,14 @@ static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
 void nv2a_context_init(void)
 {
     if (!renderers[g_config.display.renderer]) {
+        if (xemu_gpu_strict_mode()) {
+            fprintf(stderr, "Fatal error: configured renderer unavailable "
+                            "in strict GPU mode\n");
+            xemu_gpu_info_record_failure(NULL,
+                                         "configured renderer unavailable",
+                                         false, NULL);
+            exit(1);
+        }
         g_config.display.renderer = get_default_renderer();
         fprintf(stderr,
                 "Warning: Configured renderer unavailable. Switching to %s.\n",
@@ -290,7 +387,7 @@ void nv2a_context_init(void)
     }
 }
 
-static bool attempt_renderer_init(PGRAPHState *pg)
+static bool attempt_renderer_init(PGRAPHState *pg, bool fallback)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
 
@@ -306,25 +403,51 @@ static bool attempt_renderer_init(PGRAPHState *pg)
     }
     if (local_err) {
         const char *msg = error_get_pretty(local_err);
-        xemu_queue_error_message(msg);
+        xemu_gpu_info_record_failure(pg->renderer->name, msg, false, NULL);
+        if (xemu_gpu_strict_mode()) {
+            fprintf(stderr, "Renderer initialization failed: %s\n", msg);
+        } else {
+            xemu_queue_error_message(msg);
+        }
         error_free(local_err);
         local_err = NULL;
         return false;
     }
+
+    const PGRAPHVkDeviceRecord *device =
+        pg->renderer->type == CONFIG_DISPLAY_RENDERER_VULKAN ?
+            xemu_gpu_info_get_actual_device() : NULL;
+    xemu_gpu_info_record_initialized(
+        device, pg->renderer->name, XEMU_GPU_PRESENTATION_UNKNOWN,
+        fallback, fallback ? "requested renderer failed to initialize" : NULL);
+    if (pg->renderer->type != CONFIG_DISPLAY_RENDERER_VULKAN) {
+        xemu_vulkan_ubershader_publish_runtime(false, false);
+    }
+    xemu_tweaks_publish_renderer(
+        pg->renderer->type == CONFIG_DISPLAY_RENDERER_VULKAN ?
+            XEMU_TWEAK_RENDERER_VULKAN :
+        pg->renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL ?
+            XEMU_TWEAK_RENDERER_OPENGL : XEMU_TWEAK_RENDERER_NONE);
 
     return true;
 }
 
 static void init_renderer(PGRAPHState *pg)
 {
-    if (attempt_renderer_init(pg)) {
+    if (attempt_renderer_init(pg, false)) {
         return;  // Success
+    }
+
+    if (xemu_gpu_strict_mode()) {
+        fprintf(stderr, "Fatal error: strict GPU request could not be "
+                        "initialized\n");
+        exit(1);
     }
 
     CONFIG_DISPLAY_RENDERER default_renderer = get_default_renderer();
     if (default_renderer != g_config.display.renderer) {
         g_config.display.renderer = default_renderer;
-        if (attempt_renderer_init(pg)) {
+        if (attempt_renderer_init(pg, true)) {
             g_autofree gchar *msg = g_strdup_printf(
                 "Switched to default renderer: %s", pg->renderer->name);
             xemu_queue_notification(msg);
@@ -347,26 +470,44 @@ void pgraph_destroy(PGRAPHState *pg)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
 
+    xemu_tweaks_publish_renderer(XEMU_TWEAK_RENDERER_NONE);
     if (pg->renderer->ops.finalize) {
        pg->renderer->ops.finalize(d);
     }
+    xemu_vulkan_ubershader_publish_runtime(false, false);
 
+    qemu_event_destroy(&pg->renderer_switch_progress);
     qemu_mutex_destroy(&pg->lock);
+}
+
+static PGRAPHRendererSwitchCoordinator renderer_switch_coordinator(
+    NV2AState *d)
+{
+    return (PGRAPHRendererSwitchCoordinator) {
+        .pfifo_lock = &d->pfifo.lock,
+        .pgraph_lock = &d->pgraph.lock,
+        .renderer_lock = &d->pgraph.renderer_lock,
+        .framebuffer_released = &d->pgraph.framebuffer_released,
+        .switch_progress = &d->pgraph.renderer_switch_progress,
+        .switch_complete = &d->pgraph.renderer_switch_complete,
+        .framebuffer_in_use = &d->pgraph.framebuffer_in_use,
+        .handoff_pending = &d->pgraph.renderer_switch_handoff_pending,
+    };
 }
 
 int nv2a_get_framebuffer_surface(void)
 {
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
+    PGRAPHRendererSwitchCoordinator coordinator =
+        renderer_switch_coordinator(d);
     int s = 0;
 
-    qemu_mutex_lock(&pg->renderer_lock);
-    assert(!pg->framebuffer_in_use);
-    pg->framebuffer_in_use = true;
+    pgraph_renderer_switch_framebuffer_acquire_begin(&coordinator);
     if (pg->renderer->ops.get_framebuffer_surface) {
         s = pg->renderer->ops.get_framebuffer_surface(d);
     }
-    qemu_mutex_unlock(&pg->renderer_lock);
+    pgraph_renderer_switch_framebuffer_acquire_end(&coordinator);
 
     return s;
 }
@@ -374,11 +515,10 @@ int nv2a_get_framebuffer_surface(void)
 void nv2a_release_framebuffer_surface(void)
 {
     NV2AState *d = g_nv2a;
-    PGRAPHState *pg = &d->pgraph;
-    qemu_mutex_lock(&pg->renderer_lock);
-    pg->framebuffer_in_use = false;
-    qemu_cond_broadcast(&pg->framebuffer_released);
-    qemu_mutex_unlock(&pg->renderer_lock);
+    PGRAPHRendererSwitchCoordinator coordinator =
+        renderer_switch_coordinator(d);
+
+    pgraph_renderer_switch_framebuffer_release(&coordinator);
 }
 
 void nv2a_set_surface_scale_factor(unsigned int scale)
@@ -391,6 +531,7 @@ void nv2a_set_surface_scale_factor(unsigned int scale)
         d->pgraph.renderer->ops.set_surface_scale_factor(d, scale);
     }
     qemu_mutex_unlock(&d->pgraph.renderer_lock);
+    qemu_event_set(&d->pgraph.renderer_switch_progress);
     bql_lock();
 }
 
@@ -405,6 +546,7 @@ unsigned int nv2a_get_surface_scale_factor(void)
         s = d->pgraph.renderer->ops.get_surface_scale_factor(d);
     }
     qemu_mutex_unlock(&d->pgraph.renderer_lock);
+    qemu_event_set(&d->pgraph.renderer_switch_progress);
     bql_lock();
 
     return s;
@@ -514,13 +656,33 @@ static const struct {
 #undef DEF_METHOD_CASE_4_OFFSET
 #undef DEF_METHOD_CASE_4
 
+static bool pgraph_method_trace_enabled(void)
+{
+    return trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD) ||
+           trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD_ABBREV);
+}
+
 static void pgraph_method_log(unsigned int subchannel,
                               unsigned int graphics_class,
                               unsigned int method, uint32_t parameter)
 {
-    const char *method_name = "?";
     static unsigned int last = 0;
     static unsigned int count = 0;
+    static bool tracing = false;
+
+    bool enabled = pgraph_method_trace_enabled();
+    if (!enabled) {
+        tracing = false;
+        return;
+    }
+
+    if (!tracing) {
+        last = 0;
+        count = 0;
+        tracing = true;
+    }
+
+    const char *method_name = "?";
 
     if (last == NV097_ARRAY_ELEMENT16 && method != last) {
         method_name = "NV097_ARRAY_ELEMENT16";
@@ -577,8 +739,91 @@ static void pgraph_method_inc(MethodFunc handler, uint32_t end,
     *num_words_consumed = count;
 }
 
+static void pgraph_expand_draw_arrays(NV2AState *d);
+static bool pgraph_method_array_bulk(NV2AState *d, PGRAPHState *pg,
+                                     unsigned int method,
+                                     uint32_t *parameters,
+                                     size_t num_words_available);
+
+static bool pgraph_method_array_packet_fits(PGRAPHState *pg,
+                                            unsigned int method,
+                                            size_t packet_words)
+{
+    size_t current_length;
+    size_t pending_values = 0;
+    size_t values_per_word = method == NV097_ARRAY_ELEMENT16 ? 2 : 1;
+
+    if (method == NV097_INLINE_ARRAY) {
+        current_length = pg->inline_array_length;
+    } else {
+        current_length = pg->inline_elements_length;
+        if (pg->draw_arrays_length) {
+            /* pgraph_expand_draw_arrays() flushes earlier entries first. */
+            if (pg->draw_arrays_length > 1) {
+                current_length = 0;
+            }
+            pending_values =
+                pg->draw_arrays_count[pg->draw_arrays_length - 1];
+        }
+    }
+
+    return pgraph_inline_packet_plan_length(
+        current_length, pending_values, packet_words, values_per_word,
+        NV2A_MAX_BATCH_LENGTH, NULL);
+}
+
+static void pgraph_drop_oversized_array_packet(unsigned int method,
+                                                size_t packet_words)
+{
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "NV2A PGRAPH: dropping oversized method 0x%04x "
+                  "packet (%zu words)\n",
+                  method, packet_words);
+}
+
 static void pgraph_method_non_inc(MethodFunc handler, METHOD_HANDLER_ARG_DECL)
 {
+    bool array_packet = method == NV097_ARRAY_ELEMENT16 ||
+                        method == NV097_ARRAY_ELEMENT32 ||
+                        method == NV097_INLINE_ARRAY;
+
+    if (array_packet) {
+        size_t packet_words = inc ? 1 : num_words_available;
+        if (!pgraph_method_array_packet_fits(pg, method, packet_words)) {
+            pgraph_drop_oversized_array_packet(method, packet_words);
+            if (!inc && pgraph_method_trace_enabled()) {
+                for (size_t i = 1; i < packet_words; i++) {
+                    pgraph_method_log(subchannel, NV_KELVIN_PRIMITIVE,
+                                      method, ldl_le_p(parameters + i));
+                }
+            }
+            *num_words_consumed = packet_words;
+            return;
+        }
+
+        if (xemu_tweak_enabled(XEMU_TWEAK_PGRAPH_BULK_PACKETS)) {
+            PGRAPHInlinePacketMode mode = pgraph_inline_packet_mode(
+                inc, pgraph_method_trace_enabled());
+
+            switch (mode) {
+            case PGRAPH_INLINE_PACKET_SCALAR_INCREMENTING:
+                handler(METHOD_HANDLER_ARGS);
+                return;
+            case PGRAPH_INLINE_PACKET_SCALAR_TRACE:
+                break;
+            case PGRAPH_INLINE_PACKET_BULK:
+                if (pgraph_method_array_bulk(d, pg, method, parameters,
+                                             num_words_available)) {
+                    *num_words_consumed = num_words_available;
+                    return;
+                }
+                break;
+            default:
+                g_assert_not_reached();
+            }
+        }
+    }
+
     if (inc) {
         handler(METHOD_HANDLER_ARGS);
         return;
@@ -702,7 +947,14 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     case NV_CONTEXT_PATTERN: {
         switch (method) {
         case NV044_SET_MONOCHROME_COLOR0:
-            pgraph_reg_w(pg, NV_PGRAPH_PATT_COLOR0, parameter);
+            /*
+             * Xbox D3D GPU fence value, busy-polled by the guest CPU; see
+             * the lock-free read path in pgraph_read. The barrier orders
+             * the pgraph effects of preceding methods before the fence
+             * store becomes visible to the polling vCPU.
+             */
+            smp_wmb();
+            pgraph_reg_w_atomic(pg, NV_PGRAPH_PATT_COLOR0, parameter);
             break;
         default:
             goto unhandled;
@@ -835,7 +1087,7 @@ DEF_METHOD(NV097, NO_OPERATION)
     unsigned channel_id =
         PG_GET_MASK(NV_PGRAPH_CTX_USER, NV_PGRAPH_CTX_USER_CHID);
 
-    assert(!(pg->pending_interrupts & NV_PGRAPH_INTR_ERROR));
+    assert(!(qatomic_read(&pg->pending_interrupts) & NV_PGRAPH_INTR_ERROR));
 
     PG_SET_MASK(NV_PGRAPH_TRAPPED_ADDR, NV_PGRAPH_TRAPPED_ADDR_CHID,
              channel_id);
@@ -846,11 +1098,10 @@ DEF_METHOD(NV097, NO_OPERATION)
     pgraph_reg_w(pg, NV_PGRAPH_TRAPPED_DATA_LOW, parameter);
     pgraph_reg_w(pg, NV_PGRAPH_NSOURCE,
                  NV_PGRAPH_NSOURCE_NOTIFICATION); /* TODO: check this */
-    pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
-    pg->waiting_for_nop = true;
-
     qemu_mutex_unlock(&pg->lock);
     bql_lock();
+    qatomic_set(&pg->waiting_for_nop, true);
+    qatomic_or(&pg->pending_interrupts, NV_PGRAPH_INTR_ERROR);
     nv2a_update_irq(d);
     bql_unlock();
     qemu_mutex_lock(&pg->lock);
@@ -863,36 +1114,24 @@ DEF_METHOD(NV097, WAIT_FOR_IDLE)
 
 DEF_METHOD(NV097, SET_FLIP_READ)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_READ_3D,
-             parameter);
+    pgraph_flip_set(pg, NV_PGRAPH_SURFACE_READ_3D, parameter);
 }
 
 DEF_METHOD(NV097, SET_FLIP_WRITE)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D,
-             parameter);
+    pgraph_flip_set(pg, NV_PGRAPH_SURFACE_WRITE_3D, parameter);
 }
 
 DEF_METHOD(NV097, SET_FLIP_MODULO)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_MODULO_3D,
-             parameter);
+    pgraph_flip_set(pg, NV_PGRAPH_SURFACE_MODULO_3D, parameter);
 }
 
 DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
 {
-    uint32_t old =
-        PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);
-
-    PG_SET_MASK(NV_PGRAPH_SURFACE,
-             NV_PGRAPH_SURFACE_WRITE_3D,
-             (PG_GET_MASK(NV_PGRAPH_SURFACE,
-                      NV_PGRAPH_SURFACE_WRITE_3D)+1)
-                % PG_GET_MASK(NV_PGRAPH_SURFACE,
-                           NV_PGRAPH_SURFACE_MODULO_3D) );
-
-    uint32_t new =
-        PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);
+    uint32_t state = pgraph_flip_increment(pg, NV_PGRAPH_SURFACE_WRITE_3D);
+    uint32_t old = GET_MASK(state, NV_PGRAPH_SURFACE_WRITE_3D);
+    uint32_t new = (old + 1) % GET_MASK(state, NV_PGRAPH_SURFACE_MODULO_3D);
 
     trace_nv2a_pgraph_flip_increment_write(old, new);
     pg->frame_time++;
@@ -904,7 +1143,7 @@ DEF_METHOD(NV097, FLIP_STALL)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
-    pg->waiting_for_flip = true;
+    qatomic_set(&pg->waiting_for_flip, true);
 }
 
 // TODO: these should be loading the dma objects from ramin here?
@@ -916,11 +1155,18 @@ DEF_METHOD(NV097, SET_CONTEXT_DMA_NOTIFIES)
 
 DEF_METHOD(NV097, SET_CONTEXT_DMA_A)
 {
+    if (pg->dma_a != parameter) {
+        /* Texture and palette source addresses can depend on this handle. */
+        memset(pg->texture_dirty, true, sizeof(pg->texture_dirty));
+    }
     pg->dma_a = parameter;
 }
 
 DEF_METHOD(NV097, SET_CONTEXT_DMA_B)
 {
+    if (pg->dma_b != parameter) {
+        memset(pg->texture_dirty, true, sizeof(pg->texture_dirty));
+    }
     pg->dma_b = parameter;
 }
 
@@ -990,6 +1236,9 @@ DEF_METHOD(NV097, SET_SURFACE_FORMAT)
 {
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
 
+    uint32_t old_zeta_format = pg->surface_shape.zeta_format;
+    uint32_t old_anti_aliasing = pg->surface_shape.anti_aliasing;
+
     pg->surface_shape.color_format =
         GET_MASK(parameter, NV097_SET_SURFACE_FORMAT_COLOR);
     pg->surface_shape.zeta_format =
@@ -1000,6 +1249,12 @@ DEF_METHOD(NV097, SET_SURFACE_FORMAT)
         GET_MASK(parameter, NV097_SET_SURFACE_FORMAT_WIDTH);
     pg->surface_shape.log_height =
         GET_MASK(parameter, NV097_SET_SURFACE_FORMAT_HEIGHT);
+
+    if (old_zeta_format != pg->surface_shape.zeta_format ||
+        old_anti_aliasing != pg->surface_shape.anti_aliasing) {
+        pgraph_uniform_input_touch_stages(
+            pg, PGRAPH_UNIFORM_STAGE_MASK_BOTH);
+    }
 
     int surface_type = GET_MASK(parameter, NV097_SET_SURFACE_FORMAT_TYPE);
     if (surface_type != pg->surface_type) {
@@ -1056,6 +1311,7 @@ DEF_METHOD(NV097, SET_TEXTURE_ADDRESS)
 {
     int slot = (method - NV097_SET_TEXTURE_ADDRESS) / 64;
     pgraph_reg_w(pg, NV_PGRAPH_TEXADDRESS0 + slot * 4, parameter);
+    pgraph_texture_stage_invalidate(pg->texture_dirty, slot);
 }
 
 DEF_METHOD(NV097, SET_CONTROL0)
@@ -1635,13 +1891,15 @@ DEF_METHOD_INC(NV097, SET_MATERIAL_EMISSION)
 {
     int slot = (method - NV097_SET_MATERIAL_EMISSION) / 4;
     // FIXME: Verify NV_IGRAPH_XF_LTCTXA_CM_COL is correct
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_CM_COL][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_CM_COL] = true;
+    pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                             NV_IGRAPH_XF_LTCTXA_CM_COL, slot, parameter);
 }
 
 DEF_METHOD(NV097, SET_MATERIAL_ALPHA)
 {
-    pg->material_alpha = *(float*)&parameter;
+    pgraph_uniform_float_bits_update(
+        &pg->material_alpha, parameter, &pg->uniform_source_epochs,
+        PGRAPH_UNIFORM_STAGE_MASK_VSH);
 }
 
 DEF_METHOD(NV097, SET_SPECULAR_ENABLE)
@@ -1741,8 +1999,8 @@ DEF_METHOD_INC(NV097, SET_PROJECTION_MATRIX)
     int slot = (method - NV097_SET_PROJECTION_MATRIX) / 4;
     // pg->projection_matrix[slot] = *(float*)&parameter;
     unsigned int row = NV_IGRAPH_XF_XFCTX_PMAT0 + slot/4;
-    pg->vsh_constants[row][slot%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, slot % 4, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_MODEL_VIEW_MATRIX)
@@ -1751,8 +2009,8 @@ DEF_METHOD_INC(NV097, SET_MODEL_VIEW_MATRIX)
     unsigned int matnum = slot / 16;
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_MMAT0 + matnum*8 + entry/4;
-    pg->vsh_constants[row][entry % 4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, entry % 4, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_INVERSE_MODEL_VIEW_MATRIX)
@@ -1761,16 +2019,16 @@ DEF_METHOD_INC(NV097, SET_INVERSE_MODEL_VIEW_MATRIX)
     unsigned int matnum = slot / 16;
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_IMMAT0 + matnum*8 + entry/4;
-    pg->vsh_constants[row][entry % 4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, entry % 4, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_COMPOSITE_MATRIX)
 {
     int slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
     unsigned int row = NV_IGRAPH_XF_XFCTX_CMAT0 + slot/4;
-    pg->vsh_constants[row][slot%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, slot % 4, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_TEXTURE_MATRIX)
@@ -1779,8 +2037,8 @@ DEF_METHOD_INC(NV097, SET_TEXTURE_MATRIX)
     unsigned int tex = slot / 16;
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_T0MAT + tex*8 + entry/4;
-    pg->vsh_constants[row][entry%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, entry % 4, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_FOG_PARAMS)
@@ -1792,8 +2050,8 @@ DEF_METHOD_INC(NV097, SET_FOG_PARAMS)
         /* FIXME: No idea where slot = 2 is */
     }
 
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_FOG_K][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_FOG_K] = true;
+    pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                             NV_IGRAPH_XF_LTCTXA_FOG_K, slot, parameter);
 }
 
 /* Handles NV097_SET_TEXGEN_PLANE_S,T,R,Q */
@@ -1803,8 +2061,8 @@ DEF_METHOD_INC(NV097, SET_TEXGEN_PLANE_S)
     unsigned int tex = slot / 16;
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_TG0MAT + tex*8 + entry/4;
-    pg->vsh_constants[row][entry%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             row, entry % 4, parameter);
 }
 
 DEF_METHOD(NV097, SET_TEXGEN_VIEW_MODEL)
@@ -1816,8 +2074,8 @@ DEF_METHOD(NV097, SET_TEXGEN_VIEW_MODEL)
 DEF_METHOD_INC(NV097, SET_FOG_PLANE)
 {
     int slot = (method - NV097_SET_FOG_PLANE) / 4;
-    pg->vsh_constants[NV_IGRAPH_XF_XFCTX_FOG][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_FOG] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             NV_IGRAPH_XF_XFCTX_FOG, slot, parameter);
 }
 
 struct CurveCoefficients {
@@ -1921,7 +2179,9 @@ static float reconstruct_specular_power(const float *params) {
 DEF_METHOD_INC(NV097, SET_SPECULAR_PARAMS)
 {
     int slot = (method - NV097_SET_SPECULAR_PARAMS) / 4;
-    pg->specular_params[slot] = *(float *)&parameter;
+    pgraph_uniform_float_bits_update(
+        &pg->specular_params[slot], parameter, &pg->uniform_source_epochs,
+        PGRAPH_UNIFORM_STAGE_MASK_VSH);
     if (slot == 5) {
         pg->specular_power = reconstruct_specular_power(pg->specular_params);
     }
@@ -1931,28 +2191,30 @@ DEF_METHOD_INC(NV097, SET_SCENE_AMBIENT_COLOR)
 {
     int slot = (method - NV097_SET_SCENE_AMBIENT_COLOR) / 4;
     // ??
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_FR_AMB][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_FR_AMB] = true;
+    pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                             NV_IGRAPH_XF_LTCTXA_FR_AMB, slot, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_VIEWPORT_OFFSET)
 {
     int slot = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
-    pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPOFF][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPOFF] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             NV_IGRAPH_XF_XFCTX_VPOFF, slot, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_POINT_PARAMS)
 {
     int slot = (method - NV097_SET_POINT_PARAMS) / 4;
-    pg->point_params[slot] = *(float *)&parameter; /* FIXME: Where? */
+    pgraph_uniform_float_bits_update(
+        &pg->point_params[slot], parameter, &pg->uniform_source_epochs,
+        PGRAPH_UNIFORM_STAGE_MASK_VSH); /* FIXME: Where? */
 }
 
 DEF_METHOD_INC(NV097, SET_EYE_POSITION)
 {
     int slot = (method - NV097_SET_EYE_POSITION) / 4;
-    pg->vsh_constants[NV_IGRAPH_XF_XFCTX_EYEP][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_EYEP] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             NV_IGRAPH_XF_XFCTX_EYEP, slot, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_COMBINER_FACTOR0)
@@ -1988,8 +2250,8 @@ DEF_METHOD_INC(NV097, SET_COLOR_KEY_COLOR)
 DEF_METHOD_INC(NV097, SET_VIEWPORT_SCALE)
 {
     int slot = (method - NV097_SET_VIEWPORT_SCALE) / 4;
-    pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPSCL][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPSCL] = true;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             NV_IGRAPH_XF_XFCTX_VPSCL, slot, parameter);
 }
 
 DEF_METHOD_INC(NV097, SET_TRANSFORM_PROGRAM)
@@ -2017,9 +2279,8 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
 
     assert(const_load < NV2A_VERTEXSHADER_CONSTANTS);
     // VertexShaderConstant *constant = &pg->constants[const_load];
-    pg->vsh_constants_dirty[const_load] |=
-        (parameter != pg->vsh_constants[const_load][slot%4]);
-    pg->vsh_constants[const_load][slot%4] = parameter;
+    pgraph_uniform_u32_row_w(pg, pg->vsh_constants, pg->vsh_constants_dirty,
+                             const_load, slot % 4, parameter);
 
     if (slot % 4 == 3) {
         PG_SET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
@@ -2051,20 +2312,23 @@ DEF_METHOD_INC(NV097, SET_BACK_LIGHT_AMBIENT_COLOR)
     case NV097_SET_BACK_LIGHT_AMBIENT_COLOR ...
             NV097_SET_BACK_LIGHT_AMBIENT_COLOR + 8:
         part -= NV097_SET_BACK_LIGHT_AMBIENT_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_BAMB + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_BAMB + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_BAMB + slot * 6,
+                                 part, parameter);
         break;
     case NV097_SET_BACK_LIGHT_DIFFUSE_COLOR ...
             NV097_SET_BACK_LIGHT_DIFFUSE_COLOR + 8:
         part -= NV097_SET_BACK_LIGHT_DIFFUSE_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_BDIF + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_BDIF + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_BDIF + slot * 6,
+                                 part, parameter);
         break;
     case NV097_SET_BACK_LIGHT_SPECULAR_COLOR ...
             NV097_SET_BACK_LIGHT_SPECULAR_COLOR + 8:
         part -= NV097_SET_BACK_LIGHT_SPECULAR_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_BSPC + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_BSPC + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_BSPC + slot * 6,
+                                 part, parameter);
         break;
     default:
         assert(!"Invalid back light type");
@@ -2083,56 +2347,69 @@ DEF_METHOD_INC(NV097, SET_LIGHT_AMBIENT_COLOR)
     case NV097_SET_LIGHT_AMBIENT_COLOR ...
             NV097_SET_LIGHT_AMBIENT_COLOR + 8:
         part -= NV097_SET_LIGHT_AMBIENT_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_AMB + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_AMB + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_AMB + slot * 6,
+                                 part, parameter);
         break;
     case NV097_SET_LIGHT_DIFFUSE_COLOR ...
            NV097_SET_LIGHT_DIFFUSE_COLOR + 8:
         part -= NV097_SET_LIGHT_DIFFUSE_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_DIF + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_DIF + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_DIF + slot * 6,
+                                 part, parameter);
         break;
     case NV097_SET_LIGHT_SPECULAR_COLOR ...
             NV097_SET_LIGHT_SPECULAR_COLOR + 8:
         part -= NV097_SET_LIGHT_SPECULAR_COLOR / 4;
-        pg->ltctxb[NV_IGRAPH_XF_LTCTXB_L0_SPC + slot*6][part] = parameter;
-        pg->ltctxb_dirty[NV_IGRAPH_XF_LTCTXB_L0_SPC + slot*6] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxb, pg->ltctxb_dirty,
+                                 NV_IGRAPH_XF_LTCTXB_L0_SPC + slot * 6,
+                                 part, parameter);
         break;
     case NV097_SET_LIGHT_LOCAL_RANGE:
-        pg->ltc1[NV_IGRAPH_XF_LTC1_r0 + slot][0] = parameter;
-        pg->ltc1_dirty[NV_IGRAPH_XF_LTC1_r0 + slot] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltc1, pg->ltc1_dirty,
+                                 NV_IGRAPH_XF_LTC1_r0 + slot, 0, parameter);
         break;
     case NV097_SET_LIGHT_INFINITE_HALF_VECTOR ...
             NV097_SET_LIGHT_INFINITE_HALF_VECTOR + 8:
         part -= NV097_SET_LIGHT_INFINITE_HALF_VECTOR / 4;
-        pg->light_infinite_half_vector[slot][part] = *(float*)&parameter;
+        pgraph_uniform_float_bits_update(
+            &pg->light_infinite_half_vector[slot][part], parameter,
+            &pg->uniform_source_epochs, PGRAPH_UNIFORM_STAGE_MASK_VSH);
         break;
     case NV097_SET_LIGHT_INFINITE_DIRECTION ...
             NV097_SET_LIGHT_INFINITE_DIRECTION + 8:
         part -= NV097_SET_LIGHT_INFINITE_DIRECTION / 4;
-        pg->light_infinite_direction[slot][part] = *(float*)&parameter;
+        pgraph_uniform_float_bits_update(
+            &pg->light_infinite_direction[slot][part], parameter,
+            &pg->uniform_source_epochs, PGRAPH_UNIFORM_STAGE_MASK_VSH);
         break;
     case NV097_SET_LIGHT_SPOT_FALLOFF ...
             NV097_SET_LIGHT_SPOT_FALLOFF + 8:
         part -= NV097_SET_LIGHT_SPOT_FALLOFF / 4;
-        pg->ltctxa[NV_IGRAPH_XF_LTCTXA_L0_K + slot*2][part] = parameter;
-        pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_L0_K + slot*2] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                                 NV_IGRAPH_XF_LTCTXA_L0_K + slot * 2,
+                                 part, parameter);
         break;
     case NV097_SET_LIGHT_SPOT_DIRECTION ...
             NV097_SET_LIGHT_SPOT_DIRECTION + 12:
         part -= NV097_SET_LIGHT_SPOT_DIRECTION / 4;
-        pg->ltctxa[NV_IGRAPH_XF_LTCTXA_L0_SPT + slot*2][part] = parameter;
-        pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_L0_SPT + slot*2] = true;
+        pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                                 NV_IGRAPH_XF_LTCTXA_L0_SPT + slot * 2,
+                                 part, parameter);
         break;
     case NV097_SET_LIGHT_LOCAL_POSITION ...
             NV097_SET_LIGHT_LOCAL_POSITION + 8:
         part -= NV097_SET_LIGHT_LOCAL_POSITION / 4;
-        pg->light_local_position[slot][part] = *(float*)&parameter;
+        pgraph_uniform_float_bits_update(
+            &pg->light_local_position[slot][part], parameter,
+            &pg->uniform_source_epochs, PGRAPH_UNIFORM_STAGE_MASK_VSH);
         break;
     case NV097_SET_LIGHT_LOCAL_ATTENUATION ...
             NV097_SET_LIGHT_LOCAL_ATTENUATION + 8:
         part -= NV097_SET_LIGHT_LOCAL_ATTENUATION / 4;
-        pg->light_local_attenuation[slot][part] = *(float*)&parameter;
+        pgraph_uniform_float_bits_update(
+            &pg->light_local_attenuation[slot][part], parameter,
+            &pg->uniform_source_epochs, PGRAPH_UNIFORM_STAGE_MASK_VSH);
         break;
     default:
         assert(!"Invalid light source prop or unhandled back light prop");
@@ -2492,8 +2769,8 @@ DEF_METHOD(NV097, GET_REPORT)
 DEF_METHOD_INC(NV097, SET_EYE_DIRECTION)
 {
     int slot = (method - NV097_SET_EYE_DIRECTION) / 4;
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_EYED][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_EYED] = true;
+    pgraph_uniform_u32_row_w(pg, pg->ltctxa, pg->ltctxa_dirty,
+                             NV_IGRAPH_XF_LTCTXA_EYED, slot, parameter);
 }
 
 DEF_METHOD(NV097, SET_BEGIN_END)
@@ -2615,6 +2892,7 @@ DEF_METHOD(NV097, SET_TEXTURE_BORDER_COLOR)
 {
     int slot = (method - NV097_SET_TEXTURE_BORDER_COLOR) / 64;
     pgraph_reg_w(pg, NV_PGRAPH_BORDERCOLOR0 + slot * 4, parameter);
+    pgraph_texture_stage_invalidate(pg->texture_dirty, slot);
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_SET_BUMP_ENV_MAT)
@@ -2676,6 +2954,56 @@ static void pgraph_expand_draw_arrays(NV2AState *d)
     pgraph_reset_draw_arrays(pg);
 }
 
+static bool pgraph_method_array_bulk(NV2AState *d, PGRAPHState *pg,
+                                     unsigned int method,
+                                     uint32_t *parameters,
+                                     size_t num_words_available)
+{
+    size_t values_per_word = method == NV097_ARRAY_ELEMENT16 ? 2 : 1;
+    unsigned int *length;
+    uint32_t *destination;
+
+    pgraph_check_within_begin_end_block(pg);
+
+    if (method == NV097_INLINE_ARRAY) {
+        length = &pg->inline_array_length;
+        destination = pg->inline_array;
+    } else if (method == NV097_ARRAY_ELEMENT16 ||
+               method == NV097_ARRAY_ELEMENT32) {
+        if (pg->draw_arrays_length) {
+            pgraph_expand_draw_arrays(d);
+        }
+        length = &pg->inline_elements_length;
+        destination = pg->inline_elements;
+    } else {
+        return false;
+    }
+
+    /*
+     * Preflight the whole packet before mutating the destination. In
+     * particular, ARRAY_ELEMENT16 writes two values for every input word.
+     */
+    assert(pgraph_inline_packet_fits(*length, num_words_available,
+                                     values_per_word,
+                                     NV2A_MAX_BATCH_LENGTH));
+
+    size_t output_length = *length;
+    if (method == NV097_ARRAY_ELEMENT16) {
+        for (size_t i = 0; i < num_words_available; i++) {
+            uint32_t value = ldl_le_p(parameters + i);
+            pgraph_inline_element16_store(destination + output_length, value);
+            output_length += 2;
+        }
+    } else {
+        for (size_t i = 0; i < num_words_available; i++) {
+            destination[output_length++] = ldl_le_p(parameters + i);
+        }
+    }
+
+    *length = output_length;
+    return true;
+}
+
 void pgraph_check_within_begin_end_block(PGRAPHState *pg)
 {
     if (pg->primitive_mode == PRIM_TYPE_INVALID) {
@@ -2691,9 +3019,11 @@ DEF_METHOD_NON_INC(NV097, ARRAY_ELEMENT16)
         pgraph_expand_draw_arrays(d);
     }
 
-    assert(pg->inline_elements_length < NV2A_MAX_BATCH_LENGTH);
-    pg->inline_elements[pg->inline_elements_length++] = parameter & 0xFFFF;
-    pg->inline_elements[pg->inline_elements_length++] = parameter >> 16;
+    assert(pgraph_inline_packet_fits(pg->inline_elements_length, 1, 2,
+                                     NV2A_MAX_BATCH_LENGTH));
+    pgraph_inline_element16_store(
+        pg->inline_elements + pg->inline_elements_length, parameter);
+    pg->inline_elements_length += 2;
 }
 
 DEF_METHOD_NON_INC(NV097, ARRAY_ELEMENT32)
@@ -2999,6 +3329,8 @@ DEF_METHOD(NV097, LAUNCH_TRANSFORM_PROGRAM)
     memcpy(state_linkage.input_regs, pg->vertex_state_shader_v0, sizeof(pg->vertex_state_shader_v0));
 
     nv2a_vsh_emu_execute_track_context_writes(&state, &program, pg->vsh_constants_dirty);
+    pg->vsh_rows_dirty_any |= pgraph_uniform_dirty_rows_any(
+        pg->vsh_constants_dirty, NV2A_VERTEXSHADER_CONSTANTS);
 
     nv2a_vsh_program_destroy(&program);
 }
@@ -3138,29 +3470,6 @@ void pgraph_get_clear_depth_stencil_value(PGRAPHState *pg, float *depth,
     }
 }
 
-void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
-                                         uint32_t result)
-{
-    PGRAPHState *pg = &d->pgraph;
-
-    uint64_t timestamp = 0x0011223344556677; /* FIXME: Update timestamp?! */
-    uint32_t done = 0; // FIXME: Check
-
-    hwaddr report_dma_len;
-    uint8_t *report_data =
-        (uint8_t *)nv_dma_map(d, pg->dma_report, &report_dma_len);
-
-    hwaddr offset = GET_MASK(parameter, NV097_GET_REPORT_OFFSET);
-    assert(offset < report_dma_len);
-    report_data += offset;
-
-    stq_le_p((uint64_t *)&report_data[0], timestamp);
-    stl_le_p((uint32_t *)&report_data[8], result);
-    stl_le_p((uint32_t *)&report_data[12], done);
-
-    NV2A_DPRINTF("Report result %d @%" HWADDR_PRIx, result, offset);
-}
-
 static void do_wait_for_renderer_switch(CPUState *cpu, run_on_cpu_data data)
 {
     NV2AState *d = (NV2AState *)data.host_ptr;
@@ -3172,9 +3481,72 @@ static void do_wait_for_renderer_switch(CPUState *cpu, run_on_cpu_data data)
     qemu_event_wait(&d->pgraph.renderer_switch_complete);
 }
 
+static void renderer_switch_publish_flush(void *opaque)
+{
+    NV2AState *d = opaque;
+    PGRAPHState *pg = &d->pgraph;
+
+    if (pg->renderer) {
+        qemu_event_reset(&pg->flush_complete);
+        qatomic_set(&pg->flush_pending, true);
+    }
+}
+
+static bool renderer_switch_flush_is_pending(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    return d->pgraph.renderer && qatomic_read(&d->pgraph.flush_pending);
+}
+
+static void renderer_switch_process_pending(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    d->pgraph.renderer->ops.process_pending(d);
+}
+
+static void renderer_switch_finalize_renderer(void *opaque)
+{
+    NV2AState *d = opaque;
+    PGRAPHState *pg = &d->pgraph;
+
+    xemu_tweaks_publish_renderer(XEMU_TWEAK_RENDERER_NONE);
+    if (pg->renderer && pg->renderer->ops.finalize) {
+        pg->renderer->ops.finalize(d);
+    }
+    xemu_vulkan_ubershader_publish_runtime(false, false);
+}
+
+static void renderer_switch_init_renderer(void *opaque)
+{
+    NV2AState *d = opaque;
+    PGRAPHState *pg = &d->pgraph;
+
+    init_renderer(pg);
+}
+
+static void renderer_switch_complete(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    d->pgraph.renderer_switch_phase = PGRAPH_RENDERER_SWITCH_PHASE_IDLE;
+}
+
+static const PGRAPHRendererSwitchOps renderer_switch_ops = {
+    .publish_flush = renderer_switch_publish_flush,
+    .flush_is_pending = renderer_switch_flush_is_pending,
+    .process_pending = renderer_switch_process_pending,
+    .finalize_renderer = renderer_switch_finalize_renderer,
+    .init_renderer = renderer_switch_init_renderer,
+    .complete = renderer_switch_complete,
+};
+
 void pgraph_process_pending(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
+
+    /* The PFIFO thread enters here with pfifo.lock held. */
     pg->renderer->ops.process_pending(d);
 
     if (g_config.display.renderer != pg->renderer->type &&
@@ -3186,39 +3558,10 @@ void pgraph_process_pending(NV2AState *d)
     }
 
     if (pg->renderer_switch_phase == PGRAPH_RENDERER_SWITCH_PHASE_CPU_WAITING) {
-        qemu_mutex_lock(&d->pgraph.renderer_lock);
-        qemu_mutex_unlock(&d->pfifo.lock);
-        qemu_mutex_lock(&d->pgraph.lock);
+        PGRAPHRendererSwitchCoordinator coordinator =
+            renderer_switch_coordinator(d);
 
-        if (pg->renderer) {
-            qemu_event_reset(&pg->flush_complete);
-            pg->flush_pending = true;
-
-            qemu_mutex_lock(&d->pfifo.lock);
-            qemu_mutex_unlock(&d->pgraph.lock);
-
-            pg->renderer->ops.process_pending(d);
-
-            qemu_mutex_unlock(&d->pfifo.lock);
-            qemu_mutex_lock(&d->pgraph.lock);
-            while (pg->framebuffer_in_use) {
-                qemu_cond_wait(&d->pgraph.framebuffer_released,
-                               &d->pgraph.renderer_lock);
-            }
-
-            if (pg->renderer->ops.finalize) {
-                pg->renderer->ops.finalize(d);
-            }
-        }
-
-        init_renderer(pg);
-
-        qemu_mutex_unlock(&d->pgraph.renderer_lock);
-        qemu_mutex_unlock(&d->pgraph.lock);
-        qemu_mutex_lock(&d->pfifo.lock);
-
-        pg->renderer_switch_phase = PGRAPH_RENDERER_SWITCH_PHASE_IDLE;
-        qemu_event_set(&pg->renderer_switch_complete);
+        pgraph_renderer_switch_run(&coordinator, &renderer_switch_ops, d);
     }
 }
 

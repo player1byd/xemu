@@ -432,6 +432,7 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
     surface->frame_time = pg->frame_time;
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&pg->sync_pending, true);
+    qemu_event_set(&pg->renderer_switch_progress);
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);

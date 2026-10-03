@@ -10,6 +10,7 @@ specific_ss.add(files(
 	'prmdio.c',
 	'prmvio.c',
 	'ptimer.c',
+	'ptimer_core.c',
 	'pvideo.c',
 	'stubs.c',
 	'user.c',

@@ -78,6 +78,7 @@
     _X(NV2A_PROF_FINISH_FLIP_STALL) \
     _X(NV2A_PROF_FINISH_FLUSH) \
     _X(NV2A_PROF_FINISH_STALLED) \
+    _X(NV2A_PROF_FINISH_TEXTURE_DIRTY) \
     _X(NV2A_PROF_CLEAR) \
     _X(NV2A_PROF_QUEUE_SUBMIT) \
     _X(NV2A_PROF_QUEUE_SUBMIT_AUX) \
@@ -143,7 +144,17 @@ extern NV2AStats g_nv2a_stats;
 
 const char *nv2a_profile_get_counter_name(unsigned int cnt);
 int nv2a_profile_get_counter_value(unsigned int cnt);
-void nv2a_profile_increment(void);
+int64_t nv2a_profile_increment(void);
+void nv2a_profile_log_increment(int64_t now);
+unsigned int nv2a_profile_get_increment_fps(void);
+typedef enum NV2AProfileEvent {
+    NV2A_PROFILE_EVENT_SHADER_COMPILE,
+    NV2A_PROFILE_EVENT_GPU_SUBMIT,
+    NV2A_PROFILE_EVENT_READBACK,
+    NV2A_PROFILE_EVENT_COUNT,
+} NV2AProfileEvent;
+
+void nv2a_profile_log_event_once(NV2AProfileEvent event);
 void nv2a_profile_flip_stall(void);
 
 static inline void nv2a_profile_inc_counter(enum NV2A_PROF_COUNTERS_ENUM cnt)

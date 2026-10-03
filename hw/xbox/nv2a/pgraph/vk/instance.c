@@ -18,8 +18,12 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
+#include "ui/xemu-gpu-info.h"
+#include "ui/xemu-gpu-launch.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
+#include "device-inventory.h"
 #include "xemu-version.h"
 
 #define VkExtensionPropertiesArray GArray
@@ -331,103 +335,252 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+    r->demote_to_helper_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME);
 }
 
-static bool check_device_support_required_extensions(VkPhysicalDevice device)
+static void get_required_device_extension_support(VkPhysicalDevice device,
+                                                  bool *external_memory,
+                                                  bool *external_semaphore)
 {
     g_autoptr(VkExtensionPropertiesArray) available_extensions =
         get_available_device_extensions(device);
 
-    for (int i = 0; i < ARRAY_SIZE(required_device_extensions); i++) {
-        if (!is_extension_available(available_extensions,
-                                    required_device_extensions[i])) {
-            fprintf(stderr, "required device extension not found: %s\n",
-                    required_device_extensions[i]);
-            return false;
-        }
-    }
-
-    return true;
+#ifdef WIN32
+    *external_memory = is_extension_available(
+        available_extensions, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    *external_semaphore = is_extension_available(
+        available_extensions, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#else
+    *external_memory = is_extension_available(
+        available_extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    *external_semaphore = is_extension_available(
+        available_extensions, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+#endif
 }
 
-static bool is_device_compatible(VkPhysicalDevice device)
+static uint32_t get_available_required_features(VkPhysicalDevice device)
 {
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(device, &props);
-    if (props.apiVersion < VK_API_VERSION_1_1) {
+    VkPhysicalDeviceFeatures features;
+    vkGetPhysicalDeviceFeatures(device, &features);
+    uint32_t result = 0;
+
+    if (features.depthClamp) {
+        result |= PGRAPH_VK_FEATURE_DEPTH_CLAMP;
+    }
+    if (features.fillModeNonSolid) {
+        result |= PGRAPH_VK_FEATURE_FILL_MODE_NON_SOLID;
+    }
+    if (features.geometryShader) {
+        result |= PGRAPH_VK_FEATURE_GEOMETRY_SHADER;
+    }
+    if (features.occlusionQueryPrecise) {
+        result |= PGRAPH_VK_FEATURE_OCCLUSION_QUERY_PRECISE;
+    }
+    if (features.shaderClipDistance) {
+        result |= PGRAPH_VK_FEATURE_SHADER_CLIP_DISTANCE;
+    }
+    if (features.shaderTessellationAndGeometryPointSize) {
+        result |= PGRAPH_VK_FEATURE_GEOMETRY_POINT_SIZE;
+    }
+    return result;
+}
+
+static PGRAPHVkDeviceType convert_device_type(VkPhysicalDeviceType type)
+{
+    switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        return PGRAPH_VK_DEVICE_TYPE_INTEGRATED;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        return PGRAPH_VK_DEVICE_TYPE_DISCRETE;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        return PGRAPH_VK_DEVICE_TYPE_VIRTUAL;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        return PGRAPH_VK_DEVICE_TYPE_CPU;
+    default:
+        return PGRAPH_VK_DEVICE_TYPE_OTHER;
+    }
+}
+
+typedef struct VkEnumerationContext {
+    VkInstance instance;
+    VkResult last_result;
+} VkEnumerationContext;
+
+static PGRAPHVkEnumerateStatus enumerate_physical_device_tokens(
+    void *opaque, uint32_t *count, uintptr_t *tokens)
+{
+    VkEnumerationContext *context = opaque;
+    context->last_result = vkEnumeratePhysicalDevices(
+        context->instance, count, (VkPhysicalDevice *)tokens);
+    switch (context->last_result) {
+    case VK_SUCCESS:
+        return PGRAPH_VK_ENUMERATE_SUCCESS;
+    case VK_INCOMPLETE:
+        return PGRAPH_VK_ENUMERATE_INCOMPLETE;
+    default:
+        return PGRAPH_VK_ENUMERATE_FAILURE;
+    }
+}
+
+static bool collect_device_inventory(PGRAPHVkState *r,
+                                     PGRAPHVkDeviceRecord **records_out,
+                                     VkPhysicalDevice **devices_out,
+                                     size_t *count_out, Error **errp)
+{
+    VkEnumerationContext context = {
+        .instance = r->instance,
+    };
+    uintptr_t *tokens = NULL;
+    size_t count = 0;
+    PGRAPHVkEnumerationResult enumeration =
+        pgraph_vk_enumerate_device_tokens(enumerate_physical_device_tokens,
+                                          &context, &tokens, &count);
+    if (enumeration != PGRAPH_VK_ENUMERATION_OK) {
+        if (enumeration == PGRAPH_VK_ENUMERATION_EMPTY) {
+            error_setg(errp, "No Vulkan physical devices found");
+        } else if (enumeration == PGRAPH_VK_ENUMERATION_UNSTABLE) {
+            error_setg(errp,
+                       "Vulkan physical-device inventory did not stabilize");
+        } else {
+            error_setg(errp, "Failed to enumerate Vulkan physical devices (%d)",
+                       context.last_result);
+        }
+        free(tokens);
         return false;
     }
 
-    QueueFamilyIndices indices = pgraph_vk_find_queue_families(device);
+    PGRAPHVkDeviceRecord *records = g_new0(PGRAPHVkDeviceRecord, count);
+    VkPhysicalDevice *devices = g_new(VkPhysicalDevice, count);
+    for (size_t i = 0; i < count; i++) {
+        devices[i] = (VkPhysicalDevice)tokens[i];
 
-    return is_queue_family_indicies_complete(indices) &&
-           check_device_support_required_extensions(device);
-    // FIXME: Check formats
-    // FIXME: Check vram
+        VkPhysicalDeviceIDProperties id_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+        };
+        VkPhysicalDeviceProperties2 props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &id_props,
+        };
+        vkGetPhysicalDeviceProperties2(devices[i], &props);
+
+        pstrcpy(records[i].name, sizeof(records[i].name),
+                props.properties.deviceName);
+        memcpy(records[i].device_uuid, id_props.deviceUUID,
+               sizeof(records[i].device_uuid));
+        memcpy(records[i].driver_uuid, id_props.driverUUID,
+               sizeof(records[i].driver_uuid));
+        records[i].vendor_id = props.properties.vendorID;
+        records[i].device_id = props.properties.deviceID;
+        records[i].api_version = props.properties.apiVersion;
+        records[i].driver_version = props.properties.driverVersion;
+        records[i].type = convert_device_type(props.properties.deviceType);
+
+        QueueFamilyIndices indices =
+            pgraph_vk_find_queue_families(devices[i]);
+        bool external_memory;
+        bool external_semaphore;
+        get_required_device_extension_support(devices[i], &external_memory,
+                                              &external_semaphore);
+        PGRAPHVkDeviceCapabilities capabilities = {
+            .api_version = props.properties.apiVersion,
+            .has_graphics_compute_queue =
+                is_queue_family_indicies_complete(indices),
+            .has_external_memory = external_memory,
+            .has_external_semaphore = external_semaphore,
+            .available_required_features =
+                get_available_required_features(devices[i]),
+        };
+        pgraph_vk_device_record_check_renderer_support(&records[i],
+                                                        &capabilities);
+    }
+    free(tokens);
+
+    *records_out = records;
+    *devices_out = devices;
+    *count_out = count;
+    return true;
+}
+
+bool pgraph_vk_probe_device_inventory(PGRAPHVkDeviceRecord **records,
+                                      size_t *count, Error **errp)
+{
+    g_autofree PGRAPHState *pg = g_new0(PGRAPHState, 1);
+    g_autofree PGRAPHVkState *renderer = g_new0(PGRAPHVkState, 1);
+    g_autofree VkPhysicalDevice *devices = NULL;
+
+    pg->vk_renderer_state = renderer;
+    *records = NULL;
+    *count = 0;
+
+    bool success = create_instance(pg, errp) &&
+        collect_device_inventory(renderer, records, &devices, count, errp);
+    pgraph_vk_finalize_instance(pg);
+    return success;
 }
 
 static bool select_physical_device(PGRAPHState *pg, Error **errp)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
-    VkResult result;
-
-    uint32_t num_physical_devices = 0;
-
-    result =
-        vkEnumeratePhysicalDevices(r->instance, &num_physical_devices, NULL);
-    if (result != VK_SUCCESS || num_physical_devices == 0) {
-        error_setg(errp, "Failed to find GPUs with Vulkan support");
+    g_autofree PGRAPHVkDeviceRecord *records = NULL;
+    g_autofree VkPhysicalDevice *devices = NULL;
+    size_t count = 0;
+    if (!collect_device_inventory(r, &records, &devices, &count, errp)) {
         return false;
     }
 
-    g_autofree VkPhysicalDevice *devices =
-        g_malloc_n(num_physical_devices, sizeof(VkPhysicalDevice));
-    vkEnumeratePhysicalDevices(r->instance, &num_physical_devices, devices);
+    xemu_gpu_info_record_inventory(records, count);
 
-    const char *preferred_device = g_config.display.vulkan.preferred_physical_device;
-    int preferred_device_index = -1;
+    const XemuGpuLaunchRequest *launch_request =
+        xemu_gpu_launch_request_get();
+    PGRAPHVkSelectionRequest request = launch_request->selection;
 
     fprintf(stderr, "Available physical devices:\n");
-    for (int i = 0; i < num_physical_devices; i++) {
-        vkGetPhysicalDeviceProperties(devices[i], &r->device_props);
-        bool is_preferred =
-            preferred_device &&
-            !strcmp(r->device_props.deviceName, preferred_device);
-        if (is_preferred) {
-            preferred_device_index = i;
-        }
-        fprintf(stderr, "- %s%s\n", r->device_props.deviceName,
-                is_preferred ? " *" : "");
+    for (size_t i = 0; i < count; i++) {
+        char uuid[PGRAPH_VK_DEVICE_UUID_STRING_SIZE];
+        pgraph_vk_device_uuid_format(records[i].device_uuid, uuid);
+        fprintf(stderr, "- %s [%s]: %s\n", records[i].name, uuid,
+                records[i].renderer_supported ? "compatible" :
+                                                 records[i].rejection_reason);
     }
 
-    r->physical_device = VK_NULL_HANDLE;
-
-    if (preferred_device_index >= 0 &&
-        is_device_compatible(devices[preferred_device_index])) {
-        r->physical_device = devices[preferred_device_index];
-    } else {
-        for (int i = 0; i < num_physical_devices; i++) {
-            if (is_device_compatible(devices[i])) {
-                r->physical_device = devices[i];
-                break;
-            }
-        }
+    PGRAPHVkSelectionResult selected =
+        pgraph_vk_resolve_device(records, count, &request);
+    if (selected.status != PGRAPH_VK_SELECTION_OK &&
+        request.kind == PGRAPH_VK_SELECTION_LEGACY_NAME &&
+        !launch_request->strict) {
+        warn_report("Configured Vulkan device '%s' cannot be selected: %s; "
+                    "using automatic selection",
+                    request.legacy_name,
+                    pgraph_vk_selection_status_string(selected.status));
+        request = (PGRAPHVkSelectionRequest) {
+            .kind = PGRAPH_VK_SELECTION_AUTOMATIC,
+            .allow_software = true,
+        };
+        selected = pgraph_vk_resolve_device(records, count, &request);
     }
-    if (r->physical_device == VK_NULL_HANDLE) {
-        error_setg(errp, "Failed to find a suitable GPU");
+    if (selected.status != PGRAPH_VK_SELECTION_OK) {
+        error_setg(errp, "Failed to select Vulkan physical device: %s",
+                   pgraph_vk_selection_status_string(selected.status));
         return false;
     }
 
+    r->physical_device = devices[selected.index];
+    r->selected_device = records[selected.index];
     vkGetPhysicalDeviceProperties(r->physical_device, &r->device_props);
-    xemu_settings_set_string(&g_config.display.vulkan.preferred_physical_device,
-                             r->device_props.deviceName);
     r->vk_api_version = MIN(r->vk_api_version, r->device_props.apiVersion);
 
+    char selected_uuid[PGRAPH_VK_DEVICE_UUID_STRING_SIZE];
+    pgraph_vk_device_uuid_format(r->selected_device.device_uuid,
+                                 selected_uuid);
+
     fprintf(stderr,
-            "Selected physical device: %s\n"
+            "Selected physical device: %s [%s]\n"
             "- Vendor: %x, Device: %x\n"
             "- Driver Version: %d.%d.%d\n",
-            r->device_props.deviceName,
+            r->device_props.deviceName, selected_uuid,
             r->device_props.vendorID,
             r->device_props.deviceID,
             VK_VERSION_MAJOR(r->device_props.driverVersion),
@@ -494,6 +647,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(samplerAnisotropy, false),
         F(shaderClipDistance, true),
         F(shaderTessellationAndGeometryPointSize, true),
+        F(textureCompressionBC, false),
         F(wideLines, false),
         #undef F
         // clang-format on
@@ -529,6 +683,31 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         next_struct = &custom_border_features;
     }
 
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures demote_features;
+    if (r->device_props.apiVersion >= VK_API_VERSION_1_3 ||
+        r->demote_to_helper_extension_enabled) {
+        VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures supported = {
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+        };
+        VkPhysicalDeviceFeatures2 features2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &supported,
+        };
+
+        vkGetPhysicalDeviceFeatures2(r->physical_device, &features2);
+        if (supported.shaderDemoteToHelperInvocation) {
+            demote_features =
+                (VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures){
+                    .sType =
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+                    .shaderDemoteToHelperInvocation = VK_TRUE,
+                    .pNext = next_struct,
+                };
+            next_struct = &demote_features;
+        }
+    }
+
     VkDeviceCreateInfo device_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
@@ -539,11 +718,6 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
             &g_array_index(enabled_extension_names, const char *, 0),
         .pNext = next_struct,
     };
-
-    if (enable_validation) {
-        device_create_info.enabledLayerCount = ARRAY_SIZE(validation_layers);
-        device_create_info.ppEnabledLayerNames = validation_layers;
-    }
 
     result = vkCreateDevice(r->physical_device, &device_create_info, NULL,
                             &r->device);
@@ -610,6 +784,8 @@ void pgraph_vk_init_instance(PGRAPHState *pg, Error **errp)
         select_physical_device(pg, errp) &&
         create_logical_device(pg, errp) &&
         init_allocator(pg, errp)) {
+        PGRAPHVkState *r = pg->vk_renderer_state;
+        xemu_gpu_info_set_actual_device(&r->selected_device);
         return;
     }
 

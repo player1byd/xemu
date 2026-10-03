@@ -21,6 +21,8 @@
 
 #include "hw/xbox/nv2a/nv2a_regs.h"
 #include <hw/xbox/nv2a/nv2a_int.h>
+#include "qemu/error-report.h"
+#include "hw/xbox/nv2a/pgraph/vertex-fetch-span.h"
 #include "debug.h"
 #include "renderer.h"
 
@@ -34,7 +36,7 @@ static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
 
     hwaddr end = TARGET_PAGE_ALIGN(addr + size);
     addr &= TARGET_PAGE_MASK;
-    assert(end < memory_region_size(d->vram));
+    assert(end <= memory_region_size(d->vram));
 
     static hwaddr last_addr, last_end;
     if (quick && (addr >= last_addr) && (end <= last_end)) {
@@ -61,22 +63,24 @@ void pgraph_gl_update_entire_memory_buffer(NV2AState *d)
     glBufferSubData(GL_ARRAY_BUFFER, 0, memory_region_size(d->vram), d->vram_ptr);
 }
 
-void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
-                                   unsigned int max_element, bool inline_data,
-                                   unsigned int inline_stride,
-                                   unsigned int provoking_element)
+bool pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
+                                      unsigned int max_element,
+                                      bool inline_data,
+                                      unsigned int inline_stride,
+                                      unsigned int provoking_element)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     bool updated_memory_buffer = false;
-    unsigned int num_elements = max_element - min_element + 1;
 
     if (inline_data) {
         NV2A_GL_DGROUP_BEGIN("%s (num_elements: %d inline stride: %d)",
-                             __func__, num_elements, inline_stride);
+                             __func__, max_element - min_element + 1,
+                             inline_stride);
     } else {
-        NV2A_GL_DGROUP_BEGIN("%s (num_elements: %d)", __func__, num_elements);
+        NV2A_GL_DGROUP_BEGIN("%s (num_elements: %d)", __func__,
+                             max_element - min_element + 1);
     }
 
     pg->compressed_attrs = 0;
@@ -142,27 +146,50 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         }
 
         hwaddr start = 0;
+        uint64_t element_size;
+        if (__builtin_mul_overflow((uint64_t)attr->size,
+                                   (uint64_t)attr->count,
+                                   &element_size) ||
+            element_size > sizeof(attr->inline_value)) {
+            error_report("OpenGL vertex attribute %d has invalid size", i);
+            NV2A_GL_DGROUP_END();
+            return false;
+        }
         if (inline_data) {
             glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
             attrib_data_addr = attr->inline_array_offset;
             stride = inline_stride;
         } else {
-            hwaddr dma_len;
+            hwaddr dma_limit;
             uint8_t *attr_data = (uint8_t *)nv_dma_map(
                 d, attr->dma_select ? pg->dma_vertex_b : pg->dma_vertex_a,
-                &dma_len);
-            assert(attr->offset < dma_len);
-            attrib_data_addr = attr_data + attr->offset - d->vram_ptr;
+                &dma_limit);
             stride = attr->stride;
-            start = attrib_data_addr + min_element * stride;
-            update_memory_buffer(d, start, num_elements * stride,
-                                        updated_memory_buffer);
+            uint64_t dma_base = (uintptr_t)attr_data -
+                                (uintptr_t)d->vram_ptr;
+            PGRAPHVertexFetchRange range;
+            if (!pgraph_vertex_resolve_fetch_range(
+                    dma_base, dma_limit, attr->offset,
+                    memory_region_size(d->vram), min_element, max_element,
+                    stride, element_size, &range)) {
+                error_report("OpenGL vertex attribute %d exceeds DMA or VRAM",
+                             i);
+                NV2A_GL_DGROUP_END();
+                return false;
+            }
+
+            bool surface_downloaded =
+                pgraph_gl_download_surfaces_in_range_if_dirty(
+                    d, range.fetch_start, range.fetch_size);
+            attrib_data_addr = range.attribute_base;
+            start = range.fetch_start;
+            update_memory_buffer(
+                d, range.fetch_start, range.fetch_size,
+                updated_memory_buffer && !surface_downloaded);
             updated_memory_buffer = true;
         }
 
         uint32_t provoking_element_index = provoking_element - min_element;
-        size_t element_size = attr->size * attr->count;
-        assert(element_size <= sizeof(attr->inline_value));
         const uint8_t *last_entry;
 
         if (inline_data) {
@@ -193,6 +220,7 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
     }
 
     NV2A_GL_DGROUP_END();
+    return true;
 }
 
 unsigned int pgraph_gl_bind_inline_array(NV2AState *d)
@@ -226,8 +254,10 @@ unsigned int pgraph_gl_bind_inline_array(NV2AState *d)
     GLsizeiptr buffer_size = index_count * vertex_size;
     glBufferData(GL_ARRAY_BUFFER, buffer_size, NULL, GL_STREAM_DRAW);
     glBufferSubData(GL_ARRAY_BUFFER, 0, buffer_size, pg->inline_array);
-    pgraph_gl_bind_vertex_attributes(d, 0, index_count-1, true, vertex_size,
-                                  index_count-1);
+    if (!pgraph_gl_bind_vertex_attributes(d, 0, index_count - 1, true,
+                                          vertex_size, index_count - 1)) {
+        return 0;
+    }
 
     return index_count;
 }

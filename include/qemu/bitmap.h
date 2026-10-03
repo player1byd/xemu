@@ -258,6 +258,9 @@ void bitmap_set(unsigned long *map, long i, long len);
 void bitmap_set_atomic(unsigned long *map, long i, long len);
 void bitmap_clear(unsigned long *map, long start, long nr);
 bool bitmap_test_and_clear_atomic(unsigned long *map, long start, long nr);
+/* OR the exact consumed source bits into an already-zeroed destination. */
+bool bitmap_take_and_clear_atomic(unsigned long *dst, long dst_start,
+                                  unsigned long *src, long src_start, long nr);
 bool bitmap_test_and_clear(unsigned long *map, long start, long nr);
 void bitmap_copy_and_clear_atomic(unsigned long *dst, unsigned long *src,
                                   long nr);

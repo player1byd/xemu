@@ -19,6 +19,7 @@
 
 #include "renderer.h"
 #include "debug.h"
+#include "qemu/log.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -32,9 +33,27 @@
 #endif
 
 int nv2a_vk_dgroup_indent = 0;
+bool nv2a_vk_text_debug_enabled;
+
+void pgraph_vk_text_debug_printf(const char *format, ...)
+{
+    FILE *logfile = qemu_log_trylock();
+
+    if (!logfile) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(logfile, format, args);
+    va_end(args);
+
+    qemu_log_unlock(logfile);
+}
 
 void pgraph_vk_debug_init(void)
 {
+    nv2a_vk_text_debug_enabled = qemu_loglevel_mask(LOG_NV2A);
 #ifdef CONFIG_RENDERDOC
     nv2a_dbg_renderdoc_init();
 #endif

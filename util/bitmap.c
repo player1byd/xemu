@@ -332,6 +332,41 @@ bool bitmap_test_and_clear_atomic(unsigned long *map, long start, long nr)
     return dirty != 0;
 }
 
+bool bitmap_take_and_clear_atomic(unsigned long *dst, long dst_start,
+                                  unsigned long *src, long src_start, long nr)
+{
+    bool dirty = false;
+
+    assert(dst_start >= 0 && src_start >= 0 && nr >= 0);
+
+    for (long pos = 0; pos < nr;) {
+        long src_bit = src_start + pos;
+        unsigned int src_shift = src_bit % BITS_PER_LONG;
+        long count = MIN(nr - pos, BITS_PER_LONG - src_shift);
+        unsigned long mask = BITMAP_LAST_WORD_MASK(count) << src_shift;
+        unsigned long *src_word = src + BIT_WORD(src_bit);
+
+        /* A bit set after a clean read stays set for the next consumer. */
+        if (qatomic_read(src_word) & mask) {
+            unsigned long taken = qatomic_fetch_and(src_word, ~mask) & mask;
+            if (taken) {
+                long dst_bit = dst_start + pos;
+                unsigned int dst_shift = dst_bit % BITS_PER_LONG;
+                unsigned long value = taken >> src_shift;
+
+                dst[BIT_WORD(dst_bit)] |= value << dst_shift;
+                if (dst_shift + count > BITS_PER_LONG) {
+                    dst[BIT_WORD(dst_bit) + 1] |=
+                        value >> (BITS_PER_LONG - dst_shift);
+                }
+                dirty = true;
+            }
+        }
+        pos += count;
+    }
+    return dirty;
+}
+
 void bitmap_copy_and_clear_atomic(unsigned long *dst, unsigned long *src,
                                   long nr)
 {

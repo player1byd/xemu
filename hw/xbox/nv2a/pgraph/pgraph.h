@@ -31,6 +31,8 @@
 
 #include "surface.h"
 #include "texture.h"
+#include "uniform-dirty.h"
+#include "uniform-source.h"
 #include "util.h"
 #include "vsh_regs.h"
 
@@ -191,6 +193,8 @@ typedef struct PGRAPHState {
 
     uint32_t vsh_constants[NV2A_VERTEXSHADER_CONSTANTS][4];
     bool vsh_constants_dirty[NV2A_VERTEXSHADER_CONSTANTS];
+    /* OR of the four VSH uniform row-dirty arrays below. */
+    bool vsh_rows_dirty_any;
 
     /* lighting constant arrays */
     uint32_t ltctxa[NV2A_LTCTXA_COUNT][4];
@@ -214,6 +218,7 @@ typedef struct PGRAPHState {
     float specular_power_back;
 
     float point_params[8];
+    PGRAPHUniformSourceEpochs uniform_source_epochs;
 
     VertexAttribute vertex_attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
     uint16_t compressed_attrs;
@@ -239,6 +244,7 @@ typedef struct PGRAPHState {
 
     uint32_t regs_[0x2000];
     DECLARE_BITMAP(regs_dirty, 0x2000 / sizeof(uint32_t));
+    bool regs_written_since_draw;
 
     bool clearing; // FIXME: Internal
     bool waiting_for_nop;
@@ -253,6 +259,8 @@ typedef struct PGRAPHState {
 
     bool framebuffer_in_use;
     QemuCond framebuffer_released;
+    QemuEvent renderer_switch_progress;
+    int renderer_switch_handoff_pending;
 
     enum {
         PGRAPH_RENDERER_SWITCH_PHASE_IDLE,
@@ -303,16 +311,111 @@ extern NV2AState *g_nv2a;
 static inline uint32_t pgraph_reg_r(PGRAPHState *pg, unsigned int r)
 {
     assert(r % 4 == 0);
-    return pg->regs_[r];
+    return r == NV_PGRAPH_SURFACE ? qatomic_read(&pg->regs_[r]) :
+                                   pg->regs_[r];
 }
 
 static inline void pgraph_reg_w(PGRAPHState *pg, unsigned int r, uint32_t v)
 {
     assert(r % 4 == 0);
-    if (pg->regs_[r] != v) {
-        bitmap_set(pg->regs_dirty, r / sizeof(uint32_t), 1);
+    if (r == NV_PGRAPH_SURFACE) {
+        /* Flip control is shared with MMIO and is not renderer draw state. */
+        qatomic_set(&pg->regs_[r], v);
+        return;
+    }
+    if (pg->regs_[r] == v) {
+        return;
+    }
+
+    bitmap_set(pg->regs_dirty, r / sizeof(uint32_t), 1);
+    pg->regs_written_since_draw = true;
+    PGRAPHUniformStageMask uniform_stages =
+        pgraph_reg_uniform_stage_mask(r, pg->regs_[r] ^ v);
+    if (uniform_stages) {
+        pgraph_uniform_source_touch(&pg->uniform_source_epochs,
+                                    uniform_stages);
     }
     pg->regs_[r] = v;
+}
+
+/* Both the FIFO worker and guest MMIO update fields of the same flip word.
+ * Rebuild from the latest complete word on contention; do not publish a
+ * stale masked read/modify/write over the other owner's counter. */
+static inline void pgraph_flip_set(PGRAPHState *pg, uint32_t mask,
+                                  uint32_t value)
+{
+    uint32_t old, next;
+    do {
+        old = qatomic_read(&pg->regs_[NV_PGRAPH_SURFACE]);
+        next = old;
+        SET_MASK(next, mask, value);
+    } while (qatomic_cmpxchg(&pg->regs_[NV_PGRAPH_SURFACE], old, next) != old);
+}
+
+/* Return the accepted pre-increment word for matching old/new trace values. */
+static inline uint32_t pgraph_flip_increment(PGRAPHState *pg, uint32_t mask)
+{
+    uint32_t old, next;
+    do {
+        old = qatomic_read(&pg->regs_[NV_PGRAPH_SURFACE]);
+        next = old;
+        SET_MASK(next, mask, (GET_MASK(old, mask) + 1) %
+                            GET_MASK(old, NV_PGRAPH_SURFACE_MODULO_3D));
+    } while (qatomic_cmpxchg(&pg->regs_[NV_PGRAPH_SURFACE], old, next) != old);
+    return old;
+}
+
+static inline void pgraph_uniform_input_touch(PGRAPHState *pg)
+{
+    pgraph_uniform_source_touch_unclassified(&pg->uniform_source_epochs);
+}
+
+static inline void pgraph_uniform_input_touch_stages(
+    PGRAPHState *pg, PGRAPHUniformStageMask stages)
+{
+    pgraph_uniform_source_touch(&pg->uniform_source_epochs, stages);
+}
+
+static inline void pgraph_uniform_u32_row_w(PGRAPHState *pg,
+                                            uint32_t (*rows)[4],
+                                            bool *dirty_rows,
+                                            unsigned int row,
+                                            unsigned int slot,
+                                           uint32_t value)
+{
+    pgraph_uniform_u32_row_update(rows, dirty_rows, &pg->vsh_rows_dirty_any,
+                                 row, slot, value);
+}
+
+/* Call only after every VSH source array has been copied or discarded. */
+static inline void pgraph_vsh_uniform_rows_consumed(PGRAPHState *pg)
+{
+    pg->vsh_rows_dirty_any = false;
+}
+
+/*
+ * Variant of pgraph_reg_w for registers that pgraph_read serves without
+ * taking pg->lock: the atomic store keeps the compiler from tearing or
+ * eliding the write under a concurrent lock-free reader. Writers remain
+ * serialized by pg->lock, so the dirty-tracking compare can stay plain.
+ */
+static inline void pgraph_reg_w_atomic(PGRAPHState *pg, unsigned int r,
+                                       uint32_t v)
+{
+    assert(r % 4 == 0);
+    if (pg->regs_[r] != v) {
+        bitmap_set(pg->regs_dirty, r / sizeof(uint32_t), 1);
+        pg->regs_written_since_draw = true;
+    }
+    qatomic_set(&pg->regs_[r], v);
+}
+
+/* VMState restores register storage directly, bypassing pgraph_reg_w(). */
+static inline void pgraph_invalidate_all_register_hints(PGRAPHState *pg)
+{
+    bitmap_set(pg->regs_dirty, 0, 0x2000 / sizeof(uint32_t));
+    pg->regs_written_since_draw = true;
+    pg->program_data_dirty = true;
 }
 
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg);
@@ -414,6 +517,7 @@ static inline void pgraph_argb_pack32_to_rgba_float(uint32_t argb, float *rgba)
     rgba[3] = ((argb >> 24) & 0xFF) / 255.0f; /* alpha */
 }
 
-void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter, uint32_t result);
+void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, hwaddr dma_report,
+                                         uint32_t parameter, uint32_t result);
 
 #endif

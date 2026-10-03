@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "scope": "Cycle 01 starts from the owner-accepted complete main foundation. Historical changes are included in the baseline; missing individual performance attribution remains unknown, not unaccepted.",
+  "changes": [
+    {
+      "pr": "https://github.com/Mainkill1/xemu/pull/53",
+      "change": "Quiesce the APU before snapshot load",
+      "previous_main": "586de4f32c11001c0abe072c3530236f1571b372",
+      "candidate": "c17591d59c270b352b72e648f5ed65e4b2a3e77e",
+      "merge_commit": "bd1fecb93353272dda2a810991e28945de35b665",
+      "candidate_tree": "6824a5aa4d9ca288ac96092dc9244684e995b08d",
+      "evidence": "https://github.com/Mainkill1/xemu-perf-tests/blob/a87e934/docs/evidence/main-apu-load-20260909/REPORT.md",
+      "incremental": {
+        "correctness": "Old baseline reproduced a DSP assertion; repaired candidate completed Morrowind snapshot cells on OpenGL and Vulkan",
+        "performance": "unavailable: old baseline failed readiness; no causal timing percentage established"
+      },
+      "cumulative": {
+        "performance": "Included in the initial baseline. No separate cumulative optimization gain claimed.",
+        "baseline_ref": "refs/tags/baseline/cycle-01-start"
+      }
+    }
+  ],
+  "foundation": {
+    "commit": "bd1fecb93353272dda2a810991e28945de35b665",
+    "tree": "6824a5aa4d9ca288ac96092dc9244684e995b08d",
+    "disposition": "accepted_by_owner_as_existing_stable_baseline",
+    "includes": "All existing main source, fixes, tests and diagnostics at this exact commit",
+    "historical_attribution": "Preserved commit/PR/evidence inventory; no inferred per-patch performance gain",
+    "cycle_start_delta": "Same source and binary for main versus baseline: no implementation delta, not a newly measured 0% benchmark",
+    "cycle_start_ref": "refs/tags/baseline/cycle-01-start"
+  },
+  "normalization": {
+    "pr": "https://github.com/Mainkill1/xemu/pull/62",
+    "previous_main": "bd1fecb93353272dda2a810991e28945de35b665",
+    "change_class": "documentation_only",
+    "incremental": "No product source, build, test or runtime-setting change",
+    "cumulative": "Product source remains identical to baseline; no new measured performance percentage",
+    "cycle_alignment": "Initial main and baseline are identical at baseline/cycle-01-start. Future accepted PRs advance main without moving baseline."
+  },
+  "cycle_baseline_ref": "refs/tags/baseline/cycle-01-start"
+}

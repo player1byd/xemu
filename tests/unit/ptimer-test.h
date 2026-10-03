@@ -14,6 +14,9 @@
 extern bool qtest_allowed;
 
 extern int64_t ptimer_test_time_ns;
+extern uint64_t ptimer_test_clock_read_calls;
+extern uint64_t ptimer_test_timer_mod_calls;
+extern uint64_t ptimer_test_timer_del_calls;
 
 struct QEMUTimerList {
     QEMUTimer active_timers;

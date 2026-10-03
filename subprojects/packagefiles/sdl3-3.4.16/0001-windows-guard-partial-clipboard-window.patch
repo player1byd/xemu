@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Zlib
+diff --git a/src/video/windows/SDL_windowsclipboard.c b/src/video/windows/SDL_windowsclipboard.c
+index 7cab26b6e..e6c386d4c 100644
+--- a/src/video/windows/SDL_windowsclipboard.c
++++ b/src/video/windows/SDL_windowsclipboard.c
+@@ -53 +53 @@ static BOOL WIN_OpenClipboard(SDL_VideoDevice *_this)
+-    if (_this->windows) {
++    if (_this->windows && _this->windows->internal) {

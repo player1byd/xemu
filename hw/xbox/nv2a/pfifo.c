@@ -127,13 +127,11 @@ static bool pfifo_stall_for_flip(NV2AState *d)
     bool should_stall = false;
 
     if (qatomic_read(&d->pgraph.waiting_for_flip)) {
-        qemu_mutex_lock(&d->pgraph.lock);
         if (!is_flip_stall_complete(d)) {
             should_stall = true;
         } else {
-            d->pgraph.waiting_for_flip = false;
+            qatomic_set(&d->pgraph.waiting_for_flip, false);
         }
-        qemu_mutex_unlock(&d->pgraph.lock);
     }
 
     return should_stall;
@@ -191,7 +189,7 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
         // Switch contexts if necessary
         if (can_fifo_access(d)) {
             pgraph_context_switch(d, entry.channel_id);
-            if (!d->pgraph.waiting_for_context_switch) {
+            if (!qatomic_read(&d->pgraph.waiting_for_context_switch)) {
                 num_proc =
                     pgraph_method(d, subchannel, 0, entry.instance, parameters,
                                   num_words_available, max_lookahead_words, inc);

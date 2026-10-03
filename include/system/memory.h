@@ -76,6 +76,8 @@ static inline void fuzz_dma_read_cb(size_t addr,
 extern unsigned int global_dirty_tracking;
 
 typedef struct MemoryRegionOps MemoryRegionOps;
+typedef bool (*MemoryRegionLocklessRead)(void *opaque, hwaddr addr,
+                                         unsigned int size);
 
 struct ReservedRegion {
     Range range;
@@ -844,6 +846,7 @@ struct MemoryRegion {
 
     const MemoryRegionOps *ops;
     void *opaque;
+    MemoryRegionLocklessRead lockless_read;
     MemoryRegion *container;
     int mapped_via_alias; /* Mapped via an alias, container might be NULL */
     Int128 size;
@@ -2159,6 +2162,14 @@ void memory_region_set_dirty(MemoryRegion *mr, hwaddr addr,
 bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr addr,
                                         hwaddr size, unsigned client);
 
+/* Take exact dirty pages in [addr, addr + size). The caller supplies at least
+ * BITS_TO_LONGS(number of intersecting TARGET_PAGE_SIZE pages) words. Output
+ * bit zero corresponds to the page containing addr. */
+bool memory_region_take_dirty_pages(MemoryRegion *mr, hwaddr addr,
+                                    hwaddr size, unsigned client,
+                                    unsigned long *pages,
+                                    size_t capacity_words);
+
 /**
  * memory_region_set_client_dirty: Mark a range of bytes as dirty
  *                                 in a memory region for a specified client.
@@ -2377,6 +2388,16 @@ void memory_region_clear_flush_coalesced(MemoryRegion *mr);
  * @mr: the memory region to be updated.
  */
 void memory_region_enable_lockless_io(MemoryRegion *mr);
+
+/**
+ * memory_region_set_lockless_read: Enable BQL-free selected reads.
+ *
+ * The predicate is called before dispatch and must return true only when the
+ * device read callback provides all synchronization required for @addr and
+ * @size. Other reads and all writes retain normal BQL serialization.
+ */
+void memory_region_set_lockless_read(MemoryRegion *mr,
+                                     MemoryRegionLocklessRead predicate);
 
 /**
  * memory_region_add_eventfd: Request an eventfd to be triggered when a word
@@ -2723,6 +2744,19 @@ MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
                                         uint64_t *pval,
                                         MemOp op,
                                         MemTxAttrs attrs);
+/**
+ * memory_region_dispatch_read_lockless: perform a proven lockless read.
+ *
+ * This is equivalent to memory_region_dispatch_read(), except the device-wide
+ * reentrancy guard is bypassed for this transaction. The caller must already
+ * have established that the selected device callback is safe without the BQL
+ * and without that guard.
+ */
+MemTxResult memory_region_dispatch_read_lockless(MemoryRegion *mr,
+                                                 hwaddr addr,
+                                                 uint64_t *pval,
+                                                 MemOp op,
+                                                 MemTxAttrs attrs);
 /**
  * memory_region_dispatch_write: perform a write directly to the specified
  * MemoryRegion.

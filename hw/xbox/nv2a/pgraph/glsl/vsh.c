@@ -24,6 +24,7 @@
 #include "vsh.h"
 #include "vsh-ff.h"
 #include "vsh-prog.h"
+#include "ui/xemu-tweaks.h"
 
 DEF_UNIFORM_INFO_ARR(VshUniform, VSH_UNIFORM_DECL_X)
 
@@ -127,6 +128,8 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 
     vsh->z_perspective = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                          NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE;
+    vsh->nv20_vertex_arithmetic =
+        xemu_tweak_enabled(XEMU_TWEAK_NV20_VERTEX_ARITHMETIC);
 
     vsh->point_params_enable = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
                                         NV_PGRAPH_CSV0_D_POINTPARAMSENABLE);
@@ -303,7 +306,8 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     } else {
         pgraph_glsl_gen_vsh_prog(
             VSH_VERSION_XVS, (uint32_t *)state->programmable.program_data,
-            state->programmable.program_length, header, body);
+            state->programmable.program_length,
+            state->nv20_vertex_arithmetic, header, body);
         if (!state->point_params_enable) {
             mstring_append_fmt(body, "  oPts.x = %f * %d;\n",
                                state->point_size <= 0.f ? 1.f :

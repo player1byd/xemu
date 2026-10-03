@@ -73,8 +73,8 @@ jobs:
       run: |
         pushd src
         echo -e "\
-        xemu (1:0.0.0-0) unstable; urgency=medium\n\
-          Built from ${{ inputs.pkg_version }})\n\
+        xemu (1:${{ inputs.pkg_version }}-0) unstable; urgency=medium\n\
+          Built from ${{ inputs.pkg_version }}\n\
          -- Matt Borgerson <contact@mborgerson.com>  $(date -R)" > debian/changelog
         popd
     - name: Add LLVM APT repository

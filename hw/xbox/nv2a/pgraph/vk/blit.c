@@ -24,6 +24,7 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/error-report.h"
 #include "renderer.h"
 
 static void perform_blit(int operation, uint8_t *source, uint8_t *dest,
@@ -121,7 +122,10 @@ void pgraph_vk_image_blit(NV2AState *d)
 
     SurfaceBinding *surf_src = pgraph_vk_surface_get(d, source_addr);
     if (surf_src) {
-        pgraph_vk_surface_download_if_dirty(d, surf_src);
+        if (!pgraph_vk_surface_download_if_dirty(d, surf_src)) {
+            error_report("Vulkan surface readback failed before blit source read");
+            abort();
+        }
     }
 
     hwaddr source_offset = image_blit->in_y * context_surfaces->source_pitch +
@@ -158,7 +162,10 @@ void pgraph_vk_image_blit(NV2AState *d)
     if (surf_dest) {
         if (adjusted_height < surf_dest->height ||
             row_pixels < surf_dest->width) {
-            pgraph_vk_surface_download_if_dirty(d, surf_dest);
+            if (!pgraph_vk_surface_download_if_dirty(d, surf_dest)) {
+                error_report("Vulkan surface readback failed before partial blit");
+                abort();
+            }
         } else {
             // The blit will completely replace the surface so any pending
             // download should be discarded.
@@ -224,4 +231,6 @@ void pgraph_vk_image_blit(NV2AState *d)
                                    DIRTY_MEMORY_VGA);
     memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
                                    DIRTY_MEMORY_NV2A_TEX);
+    memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
+                                   DIRTY_MEMORY_NV2A_SURFACE);
 }

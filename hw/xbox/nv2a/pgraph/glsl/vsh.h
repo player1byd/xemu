@@ -69,6 +69,7 @@ typedef struct {
 
     bool smooth_shading;
     bool z_perspective;
+    bool nv20_vertex_arithmetic;
 
     bool is_fixed_function;
     FixedFunctionVshState fixed_function;

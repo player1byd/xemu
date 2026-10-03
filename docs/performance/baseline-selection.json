@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "selection_status": "selected",
+  "cycle_id": "baseline-bd1fecb9-cycle-01",
+  "upstream_snapshot": {
+    "commit": "75650bd8cd91945f7b79774e2cee0b200ca373ff",
+    "tree": "56aaf5dc309b48a24776af9ddeb4d9234a5926ea",
+    "repository": "https://github.com/xemu-project/xemu",
+    "branch": "master"
+  },
+  "unaccepted_candidates": [
+    "https://github.com/Mainkill1/xemu/pull/51",
+    "https://github.com/Mainkill1/xemu/pull/59"
+  ],
+  "policy": "Keep this baseline fixed during cycle 01. Preserve and reuse results under their original identities. Owner acceptance of the existing foundation does not turn failed or incomplete test records into passes; run new tests on this baseline and candidates. Deliberate re-baselining requires preserving the previous source and results.",
+  "selection_authority": "Repository owner explicitly confirmed existing main as the stable known-good baseline, including its known fixes and testing addons; retain it as main.",
+  "selection_basis": "Existing main is the accepted foundation. Full-Speed was experimental aggregation; Stable was an effort to remove accidentally integrated performance work. No replacement with upstream or the historical Stable release proposal is selected.",
+  "reference": {
+    "source_commit": "c17591d59c270b352b72e648f5ed65e4b2a3e77e",
+    "comparison_main_commit": "bd1fecb93353272dda2a810991e28945de35b665",
+    "tree": "6824a5aa4d9ca288ac96092dc9244684e995b08d",
+    "exe_sha256": "3489fdcc593e942b92a612bf35a98f509ff0907e3370e1e5f45f2972d83fb16b",
+    "archive_tag": "archive/2026-09-09/main-before-normalization",
+    "release": "https://github.com/Mainkill1/xemu/releases/tag/baseline-bd1fecb9-20260909",
+    "validated_scope": "Isolated APU repair and retained Morrowind GL/VK cells; PGR2 snapshot/fresh GL/VK automated capture gates with race-UI-only visual scope; full-XISO acceptance remains unsuccessful",
+    "evidence": "https://github.com/Mainkill1/xemu-perf-tests/blob/1f5cc9d8629df9a9157d676c39545595e799a37a/docs/evidence/baseline-campaign-20260909/REPORT.md",
+    "role": "Fixed reference binary and retained results for cycle 01; no rebuild required",
+    "test_results_commit": "1f5cc9d8629df9a9157d676c39545595e799a37a",
+    "test_suite_commit": "442ec11b52ce1c9d7359825944bcbc2b5f524d07",
+    "test_catalog_id": "sha256:c5f65e25a9ca5581a55b92b73e1f9894bfb2082fd08cf79a175bd6cc94c50b8a"
+  },
+  "known_followups": [
+    "https://github.com/Mainkill1/xemu/issues/60",
+    "https://github.com/Mainkill1/xemu/issues/61",
+    "https://github.com/Mainkill1/xemu-perf-tests/issues/10",
+    "https://github.com/Mainkill1/xemu-perf-tests/issues/11"
+  ],
+  "selection_record": "https://github.com/Mainkill1/xemu/issues/38#issuecomment-5610949330",
+  "baseline_ref": "refs/tags/baseline/cycle-01-start",
+  "main_at_cycle_start_ref": "refs/tags/baseline/cycle-01-start",
+  "qualified_product_source_commit": "bd1fecb93353272dda2a810991e28945de35b665",
+  "qualified_product_source_tree": "6824a5aa4d9ca288ac96092dc9244684e995b08d",
+  "pre_alignment_tag": "baseline/cycle-01-bd1fecb9",
+  "resolved_cycle_manifest": "https://github.com/Mainkill1/xemu/releases/download/archive/2026-09-09/main-before-normalization/cycle-01-start.json",
+  "alignment": "At cycle setup main and baseline point to the same immutable cycle-start commit, including workflow documentation. Subsequent accepted PRs advance main only. Resolve baseline_ref for the exact cycle commit; the qualified product source and retained binary identities remain separately pinned."
+}

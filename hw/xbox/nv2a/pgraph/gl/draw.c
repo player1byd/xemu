@@ -22,7 +22,10 @@
 #include "qemu/fast-hash.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "debug.h"
+#include "draw-lifecycle.h"
 #include "renderer.h"
+
+static PGRAPHGLDrawResult pgraph_gl_flush_draw_internal(NV2AState *d);
 
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
@@ -135,6 +138,8 @@ void pgraph_gl_draw_begin(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
+
+    pgraph_gl_draw_lifecycle_reset(&r->draw_lifecycle);
 
     NV2A_GL_DGROUP_BEGIN("NV097_SET_BEGIN_END: 0x%x", pg->primitive_mode);
 
@@ -315,6 +320,11 @@ void pgraph_gl_draw_begin(NV2AState *d)
     glEnable(GL_SCISSOR_TEST);
     glScissor(xmin, ymin, scissor_width, scissor_height);
 
+    pgraph_gl_draw_lifecycle_prepare(
+        &r->draw_lifecycle, pg->zpass_pixel_count_enable,
+        pgraph_color_write_enabled(pg), pgraph_zeta_write_enabled(pg),
+        color_write, depth_test || stencil_test);
+
     /* Visibility testing */
     if (pg->zpass_pixel_count_enable) {
         r->gl_zpass_pixel_count_query_count++;
@@ -335,56 +345,31 @@ void pgraph_gl_draw_end(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
-    uint32_t control_0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
-    bool mask_alpha = control_0 & NV_PGRAPH_CONTROL_0_ALPHA_WRITE_ENABLE;
-    bool mask_red = control_0 & NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE;
-    bool mask_green = control_0 & NV_PGRAPH_CONTROL_0_GREEN_WRITE_ENABLE;
-    bool mask_blue = control_0 & NV_PGRAPH_CONTROL_0_BLUE_WRITE_ENABLE;
-    bool color_write = mask_alpha || mask_red || mask_green || mask_blue;
-    bool depth_test = control_0 & NV_PGRAPH_CONTROL_0_ZENABLE;
-    bool stencil_test =
-        pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE;
-    bool is_nop_draw = !(color_write || depth_test || stencil_test);
-
-    if (is_nop_draw) {
-        // FIXME: Check PGRAPH register 0x880.
-        // HW uses bit 11 in 0x880 to enable or disable a color/zeta limit
-        // check that will raise an exception in the case that a draw should
-        // modify the color and/or zeta buffer but the target(s) are masked
-        // off. This check only seems to trigger during the fragment
-        // processing, it is legal to attempt a draw that is entirely
-        // clipped regardless of 0x880. See xemu#635 for context.
-        NV2A_GL_DGROUP_END();
-        return;
+    if (r->draw_lifecycle.prepared) {
+        pgraph_gl_flush_draw(d);
     }
 
-    pgraph_gl_flush_draw(d);
-
     /* End of visibility testing */
-    if (pg->zpass_pixel_count_enable) {
+    if (pgraph_gl_draw_lifecycle_take_query(&r->draw_lifecycle)) {
         nv2a_profile_inc_counter(NV2A_PROF_QUERY);
         glEndQuery(GL_SAMPLES_PASSED);
     }
 
-    pg->draw_time++;
-    if (r->color_binding && pgraph_color_write_enabled(pg)) {
-        r->color_binding->draw_time = pg->draw_time;
-    }
-    if (r->zeta_binding && pgraph_zeta_write_enabled(pg)) {
-        r->zeta_binding->draw_time = pg->draw_time;
-    }
-
-    pgraph_gl_set_surface_dirty(pg, color_write, depth_test || stencil_test);
+    pgraph_gl_complete_draw_lifecycle(
+        pg, r, r->draw_lifecycle.result,
+        r->draw_lifecycle.color_write, r->draw_lifecycle.zeta_write,
+        r->draw_lifecycle.color_dirty, r->draw_lifecycle.zeta_dirty);
+    pgraph_gl_draw_lifecycle_reset(&r->draw_lifecycle);
     NV2A_GL_DGROUP_END();
 }
 
-void pgraph_gl_flush_draw(NV2AState *d)
+static PGRAPHGLDrawResult pgraph_gl_flush_draw_internal(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     if (!(r->color_binding || r->zeta_binding)) {
-        return;
+        return PGRAPH_GL_DRAW_EMPTY;
     }
     assert(r->shader_binding);
 
@@ -395,14 +380,17 @@ void pgraph_gl_flush_draw(NV2AState *d)
         assert(pg->inline_buffer_length == 0);
         assert(pg->inline_array_length == 0);
 
-        pgraph_gl_bind_vertex_attributes(d, pg->draw_arrays_min_start,
-                                      pg->draw_arrays_max_count - 1,
-                                      false, 0,
-                                      pg->draw_arrays_max_count - 1);
+        if (!pgraph_gl_bind_vertex_attributes(
+                d, pg->draw_arrays_min_start,
+                pg->draw_arrays_max_count - 1, false, 0,
+                pg->draw_arrays_max_count - 1)) {
+            return PGRAPH_GL_DRAW_REJECTED;
+        }
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
                           pg->draw_arrays_count,
                           pg->draw_arrays_length);
+        return PGRAPH_GL_DRAW_SUBMITTED;
     } else if (pg->inline_elements_length) {
         NV2A_GL_DPRINTF(false, "Inline Elements");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
@@ -416,9 +404,11 @@ void pgraph_gl_flush_draw(NV2AState *d)
             min_element = MIN(pg->inline_elements[i], min_element);
         }
 
-        pgraph_gl_bind_vertex_attributes(
+        if (!pgraph_gl_bind_vertex_attributes(
                 d, min_element, max_element, false, 0,
-                pg->inline_elements[pg->inline_elements_length - 1]);
+                pg->inline_elements[pg->inline_elements_length - 1])) {
+            return PGRAPH_GL_DRAW_REJECTED;
+        }
 
         VertexKey k;
         memset(&k, 0, sizeof(VertexKey));
@@ -444,6 +434,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
         glDrawElements(r->shader_binding->gl_primitive_mode,
                        pg->inline_elements_length, GL_UNSIGNED_INT,
                        (void *)0);
+        return PGRAPH_GL_DRAW_SUBMITTED;
     } else if (pg->inline_buffer_length) {
         NV2A_GL_DPRINTF(false, "Inline Buffer");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
@@ -476,15 +467,32 @@ void pgraph_gl_flush_draw(NV2AState *d)
 
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, pg->inline_buffer_length);
+        return PGRAPH_GL_DRAW_SUBMITTED;
     } else if (pg->inline_array_length) {
         NV2A_GL_DPRINTF(false, "Inline Array");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
+        if (!index_count) {
+            return PGRAPH_GL_DRAW_REJECTED;
+        }
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);
+        return PGRAPH_GL_DRAW_SUBMITTED;
     } else {
         NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
         NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");
+        return PGRAPH_GL_DRAW_EMPTY;
     }
+}
+
+void pgraph_gl_flush_draw(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+
+    if (!r->draw_lifecycle.prepared) {
+        return;
+    }
+    pgraph_gl_draw_lifecycle_record(
+        &r->draw_lifecycle, pgraph_gl_flush_draw_internal(d));
 }

@@ -24,9 +24,9 @@
 void Separator();
 void SectionTitle(const char *title);
 float GetWidgetTitleDescriptionHeight(const char *title,
-                                      const char *description);
+                                      const char *description, float width);
 void WidgetTitleDescription(const char *title, const char *description,
-                            ImVec2 pos);
+                            ImVec2 pos, float width);
 void WidgetTitleDescriptionItem(const char *str_id,
                                 const char *description = nullptr);
 float GetSliderRadius(ImVec2 size);
@@ -43,10 +43,15 @@ void FilePicker(const char *str_id, const char *current_path,
 void DrawComboChevron();
 void PrepareComboTitleDescription(const char *label, const char *description,
                                   float combo_size_ratio);
+using ChevronComboItemEnabled = bool (*)(int item);
 bool ChevronCombo(const char *label, int *current_item,
                   bool (*items_getter)(void *, int, const char **), void *data,
-                  int items_count, const char *description = NULL);
-bool ChevronCombo(const char* label, int* current_item, const char* items_separated_by_zeros, const char *description = NULL);
+                  int items_count, const char *description = NULL,
+                  ChevronComboItemEnabled item_enabled = nullptr);
+bool ChevronCombo(const char *label, int *current_item,
+                  const char *items_separated_by_zeros,
+                  const char *description = NULL,
+                  ChevronComboItemEnabled item_enabled = nullptr);
 void Hyperlink(const char *text, const char *url);
 void HelpMarker(const char* desc);
 void Logo();

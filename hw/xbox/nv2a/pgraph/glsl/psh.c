@@ -29,7 +29,9 @@
 #include "qemu/osdep.h"
 #include "hw/xbox/nv2a/debug.h"
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "hw/xbox/nv2a/pgraph/polygon-offset.h"
 #include "psh.h"
+#include "psh-uber.h"
 
 DEF_UNIFORM_INFO_ARR(PshUniform, PSH_UNIFORM_DECL_X)
 
@@ -847,6 +849,10 @@ static MString* psh_convert(struct PixelShader *ps)
     if (ps->opts.vulkan) {
         mstring_append(preflight, "};\n");
     }
+    if (ps->opts.ubershader) {
+        pgraph_glsl_append_psh_uber_declarations(
+            preflight, ps->opts.uber_binding);
+    }
 
     const char *dotmap_funcs[] = {
         "dotmap_zero_to_one",
@@ -1001,7 +1007,12 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    bool depth_replace = ps->tex_modes[2] == PS_TEXTUREMODES_DOT_ZW ||
+                         ps->tex_modes[3] == PS_TEXTUREMODES_DOT_ZW;
+    if (depth_replace) {
+        /* Texture-shader depth replaces interpolated depth and polygon offset. */
+        mstring_append(clip, "float zvalue;\n");
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1056,12 +1067,12 @@ static MString* psh_convert(struct PixelShader *ps)
     }
 
     /* Depth clipping */
-    if (ps->state->depth_clipping) {
+    if (!depth_replace && ps->state->depth_clipping) {
         mstring_append(
             clip, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
                   "  discard;\n"
                   "}\n");
-    } else {
+    } else if (!depth_replace) {
         mstring_append(
             clip, "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
     }
@@ -1257,11 +1268,24 @@ static MString* psh_convert(struct PixelShader *ps)
             break;
         case PS_TEXTUREMODES_DOT_ZW:
             assert(i >= 2);
+            assert(ps->tex_modes[i - 1] == PS_TEXTUREMODES_DOTPRODUCT);
             mstring_append_fmt(vars, "/* PS_TEXTUREMODES_DOT_ZW */\n");
             mstring_append_fmt(vars, "float dot%d = dot(pT%d.xyz, %s(t%d));\n",
                 i, i, dotmap_func, ps->input_tex[i]);
             mstring_append_fmt(vars, "vec4 t%d = vec4(0.0);\n", i);
-            // FIXME: mstring_append_fmt(vars, "gl_FragDepth = t%d.x;\n", i);
+            /* NV_texture_shader 3.8.13.1.21: preceding dot / current dot.
+             * Xbox coordinates produce guest window-depth units; the normal
+             * depth-format conversion below still applies. */
+            mstring_append_fmt(vars, "zvalue = dot%d / dot%d;\n", i - 1, i);
+            if (ps->state->depth_clipping) {
+                mstring_append(vars,
+                    "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
+                    "  discard;\n"
+                    "}\n");
+            } else {
+                mstring_append(vars,
+                    "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
+            }
             break;
         case PS_TEXTUREMODES_DOT_RFLCT_DIFF:
             assert(i == 2);
@@ -1435,19 +1459,24 @@ static MString* psh_convert(struct PixelShader *ps)
         }
     }
 
-    for (int i = 0; i < ps->num_stages; i++) {
-        ps->cur_stage = i;
-        mstring_append_fmt(ps->code, "// Stage %d\n", i);
-        MString* color = add_stage_code(ps, ps->stage[i].rgb_input, ps->stage[i].rgb_output, "rgb", false);
-        MString* alpha = add_stage_code(ps, ps->stage[i].alpha_input, ps->stage[i].alpha_output, "a", true);
+    if (ps->opts.ubershader) {
+        pgraph_glsl_append_psh_uber_body(
+            ps->code, ps->tex_modes[0] != PS_TEXTUREMODES_NONE);
+    } else {
+        for (int i = 0; i < ps->num_stages; i++) {
+            ps->cur_stage = i;
+            mstring_append_fmt(ps->code, "// Stage %d\n", i);
+            MString* color = add_stage_code(ps, ps->stage[i].rgb_input, ps->stage[i].rgb_output, "rgb", false);
+            MString* alpha = add_stage_code(ps, ps->stage[i].alpha_input, ps->stage[i].alpha_output, "a", true);
 
-        mstring_append(ps->code, mstring_get_str(color));
-        mstring_append(ps->code, mstring_get_str(alpha));
-        mstring_unref(color);
-        mstring_unref(alpha);
+            mstring_append(ps->code, mstring_get_str(color));
+            mstring_append(ps->code, mstring_get_str(alpha));
+            mstring_unref(color);
+            mstring_unref(alpha);
+        }
     }
 
-    if (ps->final_input.enabled) {
+    if (!ps->opts.ubershader && ps->final_input.enabled) {
         ps->cur_stage = 8;
         mstring_append(ps->code, "// Final Combiner\n");
         add_final_stage_code(ps, ps->final_input);
@@ -1565,19 +1594,106 @@ static void parse_combiner_output(uint32_t value, struct OutputInfo *out)
     out->cd_alphablue = flags & 0x40;
 }
 
+typedef enum PshStageResult {
+    PSH_RESULT_UNUSABLE,
+    PSH_RESULT_RGBA,
+    PSH_RESULT_RGBA_OR_HILO,
+} PshStageResult;
+
+typedef struct PshStageStatus {
+    bool consistent;
+    PshStageResult result;
+} PshStageStatus;
+
+/* NV_texture_shader 3.8.13.1.21 requires both a consistent preceding dot
+ * stage and a separate, usable previous texture input. Keep this pass on the
+ * CPU so invalid guest programs do not add fragment-shader work. */
+void pgraph_glsl_normalize_psh_state(PshState *state)
+{
+    int mode[4], input[4] = {
+        -1, 0, (state->other_stage_input >> 16) & 0xF,
+        (state->other_stage_input >> 20) & 0xF,
+    };
+    PshStageStatus stage[4] = { 0 };
+    bool have_depth_replace = false;
+
+    for (int i = 0; i < 4; i++) {
+        mode[i] = (state->shader_stage_program >> (i * 5)) & 0x1F;
+    }
+    for (int i = 0; i < 4; i++) {
+        int src = input[i];
+        bool usable_source = src >= 0 && src < i &&
+                             stage[src].consistent &&
+                             stage[src].result != PSH_RESULT_UNUSABLE;
+        stage[i].consistent = true;
+        switch (mode[i]) {
+        case PS_TEXTUREMODES_PASSTHRU:
+            stage[i].result = PSH_RESULT_RGBA;
+            break;
+        case PS_TEXTUREMODES_PROJECT2D:
+        case PS_TEXTUREMODES_PROJECT3D:
+        case PS_TEXTUREMODES_CUBEMAP:
+            /* The known depth formats are not RGBA/HILO dot-product inputs. */
+            stage[i].result = state->shadow_map[i] || state->tex_x8y24[i] ?
+                              PSH_RESULT_UNUSABLE : PSH_RESULT_RGBA_OR_HILO;
+            break;
+        case PS_TEXTUREMODES_BUMPENVMAP:
+        case PS_TEXTUREMODES_BUMPENVMAP_LUM:
+        case PS_TEXTUREMODES_DPNDNT_AR:
+        case PS_TEXTUREMODES_DPNDNT_GB:
+            stage[i].consistent = usable_source;
+            stage[i].result = usable_source ? PSH_RESULT_RGBA_OR_HILO :
+                                               PSH_RESULT_UNUSABLE;
+            break;
+        case PS_TEXTUREMODES_DOTPRODUCT:
+            stage[i].consistent = usable_source;
+            break;
+        case PS_TEXTUREMODES_DOT_ZW:
+            stage[i].consistent = i >= 2 &&
+                                  mode[i - 1] == PS_TEXTUREMODES_DOTPRODUCT &&
+                                  stage[i - 1].consistent && usable_source &&
+                                  !have_depth_replace;
+            if (stage[i].consistent) {
+                have_depth_replace = true;
+            } else {
+                state->shader_stage_program &= ~(0x1Fu << (i * 5));
+                if (i >= 2) {
+                    state->other_stage_input &= ~(0xFu << (i * 4 + 8));
+                }
+            }
+            break;
+        case PS_TEXTUREMODES_NONE:
+        case PS_TEXTUREMODES_CLIPPLANE:
+        case PS_TEXTUREMODES_BRDF:
+            break;
+        default:
+            /* A mode not classified here cannot supply a proven RGBA/HILO
+             * result to a later depth-replacement dot. Its own generator
+             * path is unchanged. */
+            stage[i].consistent = false;
+            break;
+        }
+    }
+}
+
 MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts)
 {
     int i;
     struct PixelShader ps;
+    PshState effective = *state;
     memset(&ps, 0, sizeof(ps));
 
-    ps.opts = opts;
-    ps.state = state;
+    pgraph_glsl_normalize_psh_state(&effective);
 
-    ps.num_stages = state->combiner_control & 0xFF;
-    ps.flags = state->combiner_control >> 8;
+    assert(!opts.ubershader || opts.vulkan);
+
+    ps.opts = opts;
+    ps.state = &effective;
+
+    ps.num_stages = effective.combiner_control & 0xFF;
+    ps.flags = effective.combiner_control >> 8;
     for (i = 0; i < 4; i++) {
-        ps.tex_modes[i] = (state->shader_stage_program >> (i * 5)) & 0x1F;
+        ps.tex_modes[i] = (effective.shader_stage_program >> (i * 5)) & 0x1F;
     }
 
     ps.dot_map[0] = 0;
@@ -1619,30 +1735,35 @@ MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts)
     return psh_convert(&ps);
 }
 
+void pgraph_glsl_get_psh_combiner_constants(PGRAPHState *pg,
+                                             float constants[18][4])
+{
+    for (int i = 0; i < 9; i++) {
+        uint32_t packed[2];
+        if (i == 8) {
+            /* final combiner */
+            packed[0] = pgraph_reg_r(pg, NV_PGRAPH_SPECFOGFACTOR0);
+            packed[1] = pgraph_reg_r(pg, NV_PGRAPH_SPECFOGFACTOR1);
+        } else {
+            packed[0] = pgraph_reg_r(pg,
+                                     NV_PGRAPH_COMBINEFACTOR0 + i * 4);
+            packed[1] = pgraph_reg_r(pg,
+                                     NV_PGRAPH_COMBINEFACTOR1 + i * 4);
+        }
+
+        for (int j = 0; j < 2; j++) {
+            pgraph_argb_pack32_to_rgba_float(packed[j],
+                                             constants[i * 2 + j]);
+        }
+    }
+}
+
 void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
                                         const PshUniformLocs locs,
                                         PshUniformValues *values)
 {
     if (locs[PshUniform_consts] != -1) {
-        for (int i = 0; i < 9; i++) {
-            uint32_t constant[2];
-            if (i == 8) {
-                /* final combiner */
-                constant[0] = pgraph_reg_r(pg, NV_PGRAPH_SPECFOGFACTOR0);
-                constant[1] = pgraph_reg_r(pg, NV_PGRAPH_SPECFOGFACTOR1);
-            } else {
-                constant[0] =
-                    pgraph_reg_r(pg, NV_PGRAPH_COMBINEFACTOR0 + i * 4);
-                constant[1] =
-                    pgraph_reg_r(pg, NV_PGRAPH_COMBINEFACTOR1 + i * 4);
-            }
-
-            for (int j = 0; j < 2; j++) {
-                int idx = i * 2 + j;
-                pgraph_argb_pack32_to_rgba_float(constant[j],
-                                                 values->consts[idx]);
-            }
-        }
+        pgraph_glsl_get_psh_combiner_constants(pg, values->consts);
     }
     if (locs[PshUniform_alphaRef] != -1) {
         int alpha_ref = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
@@ -1660,6 +1781,19 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
             values->colorKeyMask[i] =
                 get_color_key_mask_for_texture(pg, i);
         }
+    }
+
+    /* Bump luminance is only defined for texture stages 1 through 3. The
+     * reflected arrays still include stage 0, so initialize those bytes before
+     * the renderer compares or copies the complete uniform arrays. */
+    if (locs[PshUniform_bumpMat] != -1) {
+        memset(values->bumpMat[0], 0, sizeof(values->bumpMat[0]));
+    }
+    if (locs[PshUniform_bumpScale] != -1) {
+        values->bumpScale[0] = 0.0f;
+    }
+    if (locs[PshUniform_bumpOffset] != -1) {
+        values->bumpOffset[0] = 0.0f;
     }
 
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -1708,52 +1842,29 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
         pgraph_glsl_set_clip_range_uniform_value(pg, values->clipRange[0]);
     }
 
-    bool polygon_offset_enabled = false;
-    if (pg->primitive_mode >= PRIM_TYPE_TRIANGLES) {
-        uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
-        uint32_t polygon_mode =
-            GET_MASK(raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
-
-        if ((polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_FILL &&
-             (raster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE)) ||
-            (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE &&
-             (raster & NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE)) ||
-            (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT &&
-             (raster & NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE))) {
-            polygon_offset_enabled = true;
-        }
-    }
+    PGRAPHPolygonOffsetUniformKey polygon_offset =
+        pgraph_polygon_offset_uniform_key(
+            pg->primitive_mode, pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+            pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS),
+            pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR));
 
     if (locs[PshUniform_depthOffset] != -1) {
-        float zbias = 0.0f;
-
-        if (polygon_offset_enabled) {
-            uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
-            zbias = *(float *)&zbias_u32;
-        }
-
-        values->depthOffset[0] = zbias;
+        values->depthOffset[0] = *(float *)&polygon_offset.offset_bits;
     }
 
     if (locs[PshUniform_depthFactor] != -1) {
-        float zfactor = 0.0f;
-
-        if (polygon_offset_enabled) {
-            uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
-            zfactor = *(float *)&zfactor_u32;
-            if (zfactor != 0.0f &&
-                (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
-                 NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE)) {
-                /* FIXME: for w-buffering, polygon slope in screen-space is
-                 * computed per-pixel, but Xbox appears to use constant that
-                 * is the polygon slope at the first visible pixel in top-left
-                 * order.
-                 */
-                NV2A_UNIMPLEMENTED("NV_PGRAPH_ZOFFSETFACTOR only partially implemented for w-buffering");
-            }
-        }
-
+        float zfactor = *(float *)&polygon_offset.factor_bits;
         values->depthFactor[0] = zfactor;
+        if (zfactor != 0.0f &&
+            (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
+             NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE)) {
+            /* FIXME: for w-buffering, polygon slope in screen-space is
+             * computed per-pixel, but Xbox appears to use constant that
+             * is the polygon slope at the first visible pixel in top-left
+             * order.
+             */
+            NV2A_UNIMPLEMENTED("NV_PGRAPH_ZOFFSETFACTOR only partially implemented for w-buffering");
+        }
     }
 
     if (locs[PshUniform_surfaceScale] != -1) {

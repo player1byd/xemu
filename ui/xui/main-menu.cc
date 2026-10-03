@@ -32,6 +32,7 @@
 #include "actions.hh"
 
 #include "../xemu-input.h"
+#include "../xemu-gpu-info.h"
 #include "../xemu-notifications.h"
 #include "../xemu-settings.h"
 #include "../xemu-monitor.h"
@@ -41,6 +42,10 @@
 #include "../xemu-xbe.h"
 
 #include "../thirdparty/fatx/fatx.h"
+
+extern "C" {
+#include "ui/xemu-tweaks.h"
+}
 
 #define DEFAULT_XMU_SIZE 8388608
 
@@ -65,9 +70,6 @@ void MainMenuGeneralView::Draw()
            "Use hardware-accelerated floating point emulation (requires restart)");
 #endif
 
-    Toggle("Cache shaders to disk", &g_config.perf.cache_shaders,
-           "Reduce stutter in games by caching previously generated shaders");
-
     SectionTitle("Miscellaneous");
     Toggle("Skip startup animation", &g_config.general.skip_boot_anim,
            "Skip the full Xbox boot animation sequence");
@@ -81,6 +83,174 @@ void MainMenuGeneralView::Draw()
                });
     // toggle("Throttle DVD/HDD speeds", &g_config.general.throttle_io,
     //        "Limit DVD/HDD throughput to approximate Xbox load times");
+}
+
+static void PerformanceToggle(const char *label, bool *selected,
+                              XemuTweak tweak, const char *help)
+{
+    if (Toggle(label, selected, help)) {
+        xemu_tweaks_apply(false);
+        xemu_settings_save();
+    }
+    XemuTweakRuntimeState state = xemu_tweak_runtime_state(tweak);
+    ImGui::TextDisabled("Requested: %s   Effective: %s",
+                        state.requested ? "On" : "Off",
+                        state.effective ? "On" : "Off");
+    if (state.restart_pending) {
+        ImGui::TextDisabled("Restart xemu to apply this change.");
+    } else if (!state.available ||
+               (state.requested && !state.effective)) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", state.reason);
+        ImGui::PopTextWrapPos();
+    }
+}
+
+static const char *VulkanUbershaderModeName(
+    XemuVulkanUbershaderMode mode)
+{
+    switch (mode) {
+    case XEMU_VK_UBERSHADER_OFF:
+        return "Off";
+    case XEMU_VK_UBERSHADER_FALLBACK:
+        return "Fallback";
+    case XEMU_VK_UBERSHADER_PREWARM:
+        return "Prewarm";
+    case XEMU_VK_UBERSHADER_ALWAYS:
+        return "Always (diagnostic)";
+    default:
+        return "Unknown";
+    }
+}
+
+static bool VulkanUbershaderModeSelectable(int mode)
+{
+    return xemu_vulkan_ubershader_mode_selectable(
+        static_cast<XemuVulkanUbershaderMode>(mode));
+}
+
+static XemuVulkanUbershaderRuntimeState VulkanUbershaderModeCombo()
+{
+    if (ChevronCombo("Vulkan ubershader mode",
+                     &g_config.tweaks.vk_ubershader_mode,
+                     "Off\0"
+                     "Fallback\0"
+                     "Prewarm\0"
+                     "Always (diagnostic)\0",
+                     "Off uses specialized shaders. Fallback uses an "
+                     "already-ready fragment-combiner fallback while "
+                     "specialization is prepared. Uncovered states can still "
+                     "wait. Always forces the fragment-combiner interpreter "
+                     "for supported draws and does not prepare specialized "
+                     "fragment shaders. Prewarm uses learned families and "
+                     "cached shader artifacts to prepare fallback pipelines "
+                     "opportunistically before a draw needs them. It never "
+                     "compiles a missing prewarm artifact synchronously. "
+                     "Always may have lower GPU performance and can still "
+                     "construct a missing interpreter executable "
+                     "synchronously. Unsupported "
+                     "states or rejected interpreter resources use "
+                     "specialization. "
+                     "Mode changes require restarting xemu.",
+                     VulkanUbershaderModeSelectable)) {
+        xemu_tweaks_apply(false);
+        xemu_settings_save();
+    }
+
+    XemuVulkanUbershaderRuntimeState state =
+        xemu_vulkan_ubershader_runtime_state();
+    ImGui::TextDisabled("Selected: %s   Active: %s",
+                        VulkanUbershaderModeName(state.requested),
+                        VulkanUbershaderModeName(state.active));
+    if (state.reason && strcmp(state.reason, "Active.") != 0) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", state.reason);
+        ImGui::PopTextWrapPos();
+    }
+    if (state.restart_pending) {
+        ImGui::TextDisabled("Restart xemu to activate the selected mode.");
+    }
+    if ((state.requested == XEMU_VK_UBERSHADER_PREWARM ||
+         state.requested == XEMU_VK_UBERSHADER_ALWAYS) &&
+        !g_config.perf.cache_shaders) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled(
+            "Cross-launch family prewarm is unavailable while persistent "
+            "shader caching is disabled.");
+        ImGui::PopTextWrapPos();
+    }
+
+    return state;
+}
+
+void MainMenuAdvanceView::Draw()
+{
+    SectionTitle("Accuracy");
+    PerformanceToggle("Accurate NV20 vertex arithmetic",
+        &g_config.tweaks.nv20_vertex_arithmetic,
+        XEMU_TWEAK_NV20_VERTEX_ARITHMETIC,
+        "Uses bit-level NV20 multiply, add, MAD, dot-product and reciprocal "
+        "behavior in programmable vertex shaders. This experimental path "
+        "is substantially slower and is intended for graphics diagnosis.");
+    SectionTitle("Performance");
+#ifdef _WIN32
+    PerformanceToggle("Reduce CPU usage while waiting",
+        &g_config.tweaks.cpu_saving_wait, XEMU_TWEAK_CPU_SAVING_WAIT,
+        "Uses interruptible Windows waits instead of busy polling. This "
+        "reduces idle CPU use, but may add stutter on some systems.");
+#endif
+    PerformanceToggle("Process vertex packets in bulk",
+        &g_config.tweaks.pgraph_bulk_packets,
+        XEMU_TWEAK_PGRAPH_BULK_PACKETS,
+        "Processes compatible vertex and index commands in batches to "
+        "reduce command overhead. Applies to both renderers.");
+    PerformanceToggle("Fast GPU fence polling",
+        &g_config.tweaks.pgraph_fence_fastpath,
+        XEMU_TWEAK_PGRAPH_FENCE_FASTPATH,
+        "Uses lock-free reads for completed GPU fences to reduce contention "
+        "in games that poll them frequently. Applies to both renderers.");
+    if (Toggle("Cache shaders", &g_config.perf.cache_shaders,
+               "Stores compiled shaders on disk and reuses them on later "
+               "runs. Disable this when diagnosing first-use shader stalls.")) {
+        xemu_settings_save();
+    }
+    SectionTitle("Vulkan");
+    XemuVulkanUbershaderRuntimeState ubershader_state =
+        VulkanUbershaderModeCombo();
+    ImGui::BeginDisabled(
+        ubershader_state.active == XEMU_VK_UBERSHADER_OFF);
+    PerformanceToggle("Skip unchanged shader work",
+        &g_config.tweaks.vk_shader_fastpath,
+        XEMU_TWEAK_VK_SHADER_FASTPATH,
+        "Reuses the current shader and pipeline when their identity has not "
+        "changed. Dynamic uniforms and ubershader controls still update.");
+    ImGui::EndDisabled();
+    PerformanceToggle("Combine color downloads with rendering",
+        &g_config.tweaks.vk_color_download_folding,
+        XEMU_TWEAK_VK_COLOR_DOWNLOAD_FOLDING,
+        "Combines eligible color-surface downloads with rendering to avoid "
+        "an extra GPU submission. Unsupported downloads stay separate.");
+    PerformanceToggle("Upload only used vertex ranges",
+        &g_config.tweaks.vk_bounded_vertex_uploads,
+        XEMU_TWEAK_VK_BOUNDED_VERTEX_UPLOADS,
+        "Uploads only the vertex range referenced by the draw when attributes "
+        "must be repacked. This avoids copying unused leading vertices.");
+    PerformanceToggle("Avoid ordered vertex copies",
+        &g_config.tweaks.vk_vertex_copy_shortcuts,
+        XEMU_TWEAK_VK_VERTEX_COPY_SHORTCUTS,
+        "Uses direct writes or private versions when changed vertex data can "
+        "avoid an ordered GPU copy. Unsafe cases keep the ordered path.");
+    PerformanceToggle("Grow transient buffers to fit batches",
+        &g_config.tweaks.vk_transient_buffer_growth,
+        XEMU_TWEAK_VK_TRANSIENT_BUFFER_GROWTH,
+        "Keeps larger transient buffers after a workload needs them, reducing "
+        "later capacity flushes. Large single draws may still force growth. "
+        "Requires restarting xemu.");
+    SectionTitle("OpenGL");
+    PerformanceToggle("Upload compressed textures directly",
+        &g_config.tweaks.gl_native_s3tc, XEMU_TWEAK_GL_NATIVE_S3TC,
+        "Uploads eligible S3TC textures in compressed form for the GPU to "
+        "decode. Disable to use CPU decoding. Requires restarting xemu.");
 }
 
 bool MainMenuInputView::ConsumeRebindEvent(SDL_Event *event)
@@ -141,7 +311,7 @@ void MainMenuInputView::Draw()
     const int port_padding = 8;
     for (int i = 0; i < 4; i++) {
         bool is_selected = (i == active);
-        bool port_is_bound = (xemu_input_get_bound(i) != NULL);
+        bool port_is_bound = virtual_controllers[i].connected;
 
         // Set an X offset to center the image button within the column
         ImGui::SetCursorPosX(
@@ -221,11 +391,7 @@ void MainMenuInputView::Draw()
             is_selected = strcmp(driver, iter) == 0;
             ImGui::PushID(iter);
             if (ImGui::Selectable(iter, is_selected)) {
-                for (int j = 0; j < num_drivers; j++) {
-                    if (iter == driver_display_names[j])
-                        bound_drivers[active] = available_drivers[j];
-                }
-                xemu_input_bind(active, bound_controllers[active], 1);
+                xemu_input_set_virtual_model(active, available_drivers[i], 1);
             }
             if (is_selected) {
                 ImGui::SetItemDefaultFocus();
@@ -239,6 +405,18 @@ void MainMenuInputView::Draw()
 
     ImGui::NextColumn();
 
+    ImGui::Text("Connected to Xbox");
+    ImGui::NextColumn();
+    bool guest_connected = virtual_controllers[active].connected;
+    if (ImGui::Checkbox("###VirtualControllerConnected", &guest_connected)) {
+        if (guest_connected) {
+            xemu_input_virtual_connect(active, bound_drivers[active], 1);
+        } else {
+            xemu_input_virtual_disconnect(active, 1);
+        }
+    }
+    ImGui::NextColumn();
+
     //
     // Render input device combo
     //
@@ -248,7 +426,7 @@ void MainMenuInputView::Draw()
     ImGui::NextColumn();
 
     // List available input devices
-    const char *not_connected = "Not Connected";
+    const char *not_connected = "None (neutral input)";
     ControllerState *bound_state = xemu_input_get_bound(active);
 
     // Get current controller name
@@ -265,7 +443,7 @@ void MainMenuInputView::Draw()
         // Handle "Not connected"
         bool is_selected = bound_state == NULL;
         if (ImGui::Selectable(not_connected, is_selected)) {
-            xemu_input_bind(active, NULL, 1);
+            xemu_input_set_provider(active, NULL, 1);
             bound_state = NULL;
         }
         if (is_selected) {
@@ -284,16 +462,7 @@ void MainMenuInputView::Draw()
                 selectable_label = buf;
             }
             if (ImGui::Selectable(selectable_label, is_selected)) {
-                xemu_input_bind(active, iter, 1);
-
-                // FIXME: We want to bind the XMU here, but we can't because we
-                // just unbound it and we need to wait for Qemu to release the
-                // file
-
-                // If we previously had no controller connected, we can rebind
-                // the XMU
-                if (bound_state == NULL)
-                    xemu_input_rebind_xmu(active);
+                xemu_input_set_provider(active, iter, 1);
 
                 bound_state = iter;
             }
@@ -362,7 +531,7 @@ void MainMenuInputView::Draw()
     ImGui::PopFont();
     ImGui::SetCursorPos(pos);
 
-    if (bound_state) {
+    if (virtual_controllers[active].connected) {
         ImGui::PushID(active);
 
         SectionTitle("Expansion Slots");
@@ -384,7 +553,7 @@ void MainMenuInputView::Draw()
             // Display a combo box to allow the user to choose the type of
             // peripheral they want to use
             enum peripheral_type selected_type =
-                bound_state->peripheral_types[i];
+                virtual_controllers[active].peripheral_types[i];
             const char *peripheral_type_names[2] = { "None", "Memory Unit" };
             const char *selected_peripheral_type =
                 peripheral_type_names[selected_type];
@@ -398,34 +567,40 @@ void MainMenuInputView::Draw()
                     const char *selectable_label = peripheral_type_names[j];
 
                     if (ImGui::Selectable(selectable_label, is_selected)) {
+                        bool can_replace = true;
                         // Free any existing peripheral
-                        if (bound_state->peripherals[i] != NULL) {
-                            if (bound_state->peripheral_types[i] ==
+                        if (virtual_controllers[active].peripherals[i] != NULL) {
+                            if (virtual_controllers[active].peripheral_types[i] ==
                                 PERIPHERAL_XMU) {
                                 // Another peripheral was already bound.
                                 // Unplugging
-                                xemu_input_unbind_xmu(active, i);
+                                can_replace = xemu_input_unbind_xmu(active, i);
                             }
 
-                            // Free the existing state
-                            g_free((void *)bound_state->peripherals[i]);
-                            bound_state->peripherals[i] = NULL;
+                            if (can_replace) {
+                                // Free the existing state
+                                g_free(
+                                    virtual_controllers[active].peripherals[i]);
+                                virtual_controllers[active].peripherals[i] = NULL;
+                            }
                         }
 
-                        // Change the peripheral type to the newly selected type
-                        bound_state->peripheral_types[i] =
-                            (enum peripheral_type)j;
+                        if (can_replace) {
+                            // Change the peripheral type to the selected type
+                            virtual_controllers[active].peripheral_types[i] =
+                                (enum peripheral_type)j;
 
-                        // Allocate state for the new peripheral
-                        if (j == PERIPHERAL_XMU) {
-                            bound_state->peripherals[i] =
-                                g_malloc(sizeof(XmuState));
-                            memset(bound_state->peripherals[i], 0,
-                                   sizeof(XmuState));
+                            // Allocate state for the new peripheral
+                            if (j == PERIPHERAL_XMU) {
+                                virtual_controllers[active].peripherals[i] =
+                                    g_new0(XmuState, 1);
+                            }
+
+                            xemu_save_peripheral_settings(
+                                active, i,
+                                virtual_controllers[active].peripheral_types[i],
+                                NULL);
                         }
-
-                        xemu_save_peripheral_settings(
-                            active, i, bound_state->peripheral_types[i], NULL);
                     }
 
                     if (is_selected) {
@@ -447,12 +622,13 @@ void MainMenuInputView::Draw()
                        2 * port_padding * g_viewport_mgr.m_scale) /
                       2));
 
-            selected_type = bound_state->peripheral_types[i];
+            selected_type = virtual_controllers[active].peripheral_types[i];
             if (selected_type == PERIPHERAL_XMU) {
                 float x = xmu_x + i * xmu_x_stride;
                 float y = xmu_y;
 
-                XmuState *xmu = (XmuState *)bound_state->peripherals[i];
+                XmuState *xmu =
+                    (XmuState *)virtual_controllers[active].peripherals[i];
                 if (xmu->filename != NULL && strlen(xmu->filename) > 0) {
                     RenderXmu(x, y, 0x81dc8a00, 0x0f0f0f00);
 
@@ -541,7 +717,7 @@ void MainMenuInputView::Draw()
             ImGui::PopStyleVar();
         }
 
-        if (bound_state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        if (bound_state && bound_state->type == INPUT_DEVICE_SDL_GAMEPAD) {
             Toggle("Enable Rumble",
                    &bound_state->controller_map->enable_rumble);
             Toggle("Invert Left X Axis",
@@ -558,7 +734,7 @@ void MainMenuInputView::Draw()
                         .invert_axis_right_y);
         }
 
-        if (ImGui::Button("Reset to Default")) {
+        if (bound_state && ImGui::Button("Reset to Default")) {
             xemu_input_reset_input_mapping(bound_state);
         }
 
@@ -748,6 +924,83 @@ void MainMenuDisplayView::Draw()
 #endif
                  ,
                  "Select desired renderer implementation");
+
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_VULKAN) {
+        struct GpuChoices {
+            std::vector<std::string> labels;
+            std::vector<std::string> uuids;
+        } choices;
+        choices.labels.emplace_back("Automatic");
+        choices.uuids.emplace_back("");
+
+        size_t device_count = 0;
+        const PGRAPHVkDeviceRecord *devices =
+          xemu_gpu_info_get_inventory(&device_count);
+        for (size_t i = 0; i < device_count; i++) {
+            if (!devices[i].renderer_supported) {
+                continue;
+            }
+            char uuid[PGRAPH_VK_DEVICE_UUID_STRING_SIZE];
+            pgraph_vk_device_uuid_format(devices[i].device_uuid, uuid);
+            choices.labels.emplace_back(std::string(devices[i].name) +
+                                        " (" + std::string(uuid, 8) + ")");
+            choices.uuids.emplace_back(uuid);
+        }
+
+        int selected = 0;
+        const char *saved_uuid = g_config.display.vulkan.device_uuid;
+        if (saved_uuid != nullptr && saved_uuid[0] != '\0') {
+            bool found = false;
+            for (size_t i = 1; i < choices.uuids.size(); i++) {
+                if (choices.uuids[i] == saved_uuid) {
+                    selected = static_cast<int>(i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                choices.labels.emplace_back("Saved adapter unavailable");
+                choices.uuids.emplace_back(saved_uuid);
+                selected = static_cast<int>(choices.labels.size() - 1);
+            }
+        }
+        auto item_getter = [](void *data, int index, const char **text) {
+            auto *values = static_cast<GpuChoices *>(data);
+            if (index < 0 || static_cast<size_t>(index) >=
+                             values->labels.size()) {
+                return false;
+            }
+            *text = values->labels[index].c_str();
+            return true;
+        };
+        if (ChevronCombo("Adapter", &selected, item_getter, &choices,
+                         static_cast<int>(choices.labels.size()),
+                         "Select the Vulkan adapter used after restarting "
+                         "xemu")) {
+            xemu_settings_set_string(&g_config.display.vulkan.device_uuid,
+                                     choices.uuids[selected].c_str());
+            xemu_settings_set_string(
+              &g_config.display.vulkan.preferred_physical_device, "");
+            xemu_queue_notification(
+              "Renderer adapter changed. Restart xemu to apply it.");
+        }
+
+        const PGRAPHVkDeviceRecord *actual =
+          xemu_gpu_info_get_actual_device();
+        if (actual != nullptr) {
+            ImGui::TextDisabled("Active adapter: %s", actual->name);
+        } else {
+            ImGui::TextDisabled("Active adapter: unavailable");
+        }
+    } else if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_OPENGL) {
+        int selected = 0;
+        ImGui::BeginDisabled();
+        ChevronCombo("Adapter", &selected, "OS / driver controlled\0",
+                     "OpenGL adapter selection is controlled by the host "
+                     "operating system and graphics driver");
+        ImGui::EndDisabled();
+    }
+
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"
@@ -791,7 +1044,6 @@ void MainMenuDisplayView::Draw()
     }
     Toggle("Vertical refresh sync", &g_config.display.window.vsync,
            "Sync to screen vertical refresh to reduce tearing artifacts");
-
     SectionTitle("Interface");
     Toggle("Show main menu bar", &g_config.display.ui.show_menubar,
            "Show main menu bar when mouse is activated");
@@ -849,6 +1101,32 @@ void MainMenuAudioView::Draw()
     Toggle("DSP JIT engine", &g_config.audio.use_dsp_jit,
            "Use DSP JIT engine");
 
+    SectionTitle("Advanced");
+    if (ChevronCombo(
+            "Voice processing workers", &g_config.audio.vp.num_workers,
+            "Auto\0"
+            "1\0"
+            "2\0"
+            "3\0"
+            "4\0"
+            "5\0"
+            "6\0"
+            "7\0"
+            "8\0"
+            "9\0"
+            "10\0"
+            "11\0"
+            "12\0"
+            "13\0"
+            "14\0"
+            "15\0"
+            "16\0",
+            "Set MCPX voice processing worker threads. Auto chooses a "
+            "host-dependent count, capped at 16. Restart xemu to apply "
+            "changes.")) {
+        xemu_queue_notification(
+            "Voice processing worker count changed. Restart xemu to apply it.");
+    }
 }
 
 NetworkInterface::NetworkInterface(pcap_if_t *pcap_desc, char *_friendlyname)
@@ -1714,6 +1992,7 @@ MainMenuScene::MainMenuScene()
       m_network_button("Network", ICON_FA_NETWORK_WIRED),
       m_snapshots_button("Snapshots", ICON_FA_CLOCK_ROTATE_LEFT),
       m_system_button("System", ICON_FA_MICROCHIP),
+      m_advance_button("Advance", ICON_FA_GEARS),
       m_about_button("About", ICON_FA_CIRCLE_INFO)
 {
     m_had_focus_last_frame = false;
@@ -1725,6 +2004,7 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(&m_network_button);
     m_tabs.push_back(&m_snapshots_button);
     m_tabs.push_back(&m_system_button);
+    m_tabs.push_back(&m_advance_button);
     m_tabs.push_back(&m_about_button);
 
     m_views.push_back(&m_general_view);
@@ -1734,6 +2014,7 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_network_view);
     m_views.push_back(&m_snapshots_view);
     m_views.push_back(&m_system_view);
+    m_views.push_back(&m_advance_view);
     m_views.push_back(&m_about_view);
 
     m_current_view_index = 0;
@@ -1757,7 +2038,7 @@ void MainMenuScene::ShowSystem()
 
 void MainMenuScene::ShowAbout()
 {
-    SetNextViewIndexWithFocus(7);
+    SetNextViewIndexWithFocus(8);
 }
 
 void MainMenuScene::SetNextViewIndexWithFocus(int i)

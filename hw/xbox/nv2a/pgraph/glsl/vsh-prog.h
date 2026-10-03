@@ -25,7 +25,8 @@
 #include "qemu/mstring.h"
 
 void pgraph_glsl_gen_vsh_prog(uint16_t version, const uint32_t *tokens,
-                              unsigned int length, MString *header,
+                              unsigned int length,
+                              bool nv20_vertex_arithmetic, MString *header,
                               MString *body);
 
 #endif

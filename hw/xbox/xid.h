@@ -105,6 +105,12 @@ typedef struct XIDGamepadReport {
     int16_t sThumbRY;
 } QEMU_PACKED XIDGamepadReport;
 
+static inline void xid_gamepad_report_neutral(XIDGamepadReport *report)
+{
+    memset(report, 0, sizeof(*report));
+    report->bLength = sizeof(*report);
+}
+
 typedef struct XIDGamepadOutputReport {
     uint8_t report_id; // FIXME: is this correct?
     uint8_t length;

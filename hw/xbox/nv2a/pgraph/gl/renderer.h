@@ -36,11 +36,13 @@
 #include "hw/xbox/nv2a/pgraph/glsl/shaders.h"
 
 #include "gloffscreen.h"
+#include "texture-stage.h"
 #include "constants.h"
+#include "draw-lifecycle.h"
 
 typedef struct SurfaceBinding {
     QTAILQ_ENTRY(SurfaceBinding) entry;
-    MemAccessCallback *access_cb;
+    struct MemAccessCallback *access_cb;
 
     hwaddr vram_addr;
 
@@ -65,23 +67,6 @@ typedef struct SurfaceBinding {
     GLuint gl_buffer;
     SurfaceFormatInfo fmt;
 } SurfaceBinding;
-
-typedef struct TextureBinding {
-    unsigned int refcnt;
-    int draw_time;
-    uint64_t data_hash;
-    unsigned int scale;
-    unsigned int min_filter;
-    unsigned int mag_filter;
-    uint32_t lod_bias;
-    unsigned int addru;
-    unsigned int addrv;
-    unsigned int addrp;
-    uint32_t border_color;
-    bool border_color_set;
-    GLenum gl_target;
-    GLuint gl_texture;
-} TextureBinding;
 
 typedef struct ShaderModuleCacheKey {
     GLenum kind;
@@ -162,6 +147,7 @@ typedef struct TextureLruNode {
 typedef struct QueryReport {
     QSIMPLEQ_ENTRY(QueryReport) entry;
     bool clear;
+    hwaddr dma_report;
     uint32_t parameter;
     unsigned int query_count;
     GLuint *queries;
@@ -206,6 +192,7 @@ typedef struct PGRAPHGLState {
     unsigned int zpass_pixel_count_result;
     unsigned int gl_zpass_pixel_count_query_count;
     GLuint *gl_zpass_pixel_count_queries;
+    PGRAPHGLDrawLifecycle draw_lifecycle;
     QSIMPLEQ_HEAD(, QueryReport) report_queue;
 
     bool shader_cache_writeback_pending;
@@ -246,7 +233,12 @@ extern GloContext *g_nv2a_context_display;
 unsigned int pgraph_gl_bind_inline_array(NV2AState *d);
 void pgraph_gl_bind_shaders(PGRAPHState *pg);
 void pgraph_gl_bind_textures(NV2AState *d);
-void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element, unsigned int max_element, bool inline_data, unsigned int inline_stride, unsigned int provoking_element);
+bool pgraph_gl_bind_vertex_attributes(NV2AState *d,
+                                      unsigned int min_element,
+                                      unsigned int max_element,
+                                      bool inline_data,
+                                      unsigned int inline_stride,
+                                      unsigned int provoking_element);
 bool pgraph_gl_check_surface_to_texture_compatibility(const SurfaceBinding *surface, const TextureShape *shape);
 GLuint pgraph_gl_compile_shader(const char *vs_src, const char *fs_src);
 void pgraph_gl_download_dirty_surfaces(NV2AState *d);
@@ -280,6 +272,9 @@ void pgraph_gl_reload_surface_scale_factor(PGRAPHState *pg);
 void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface, TextureBinding *texture, TextureShape *texture_shape, int texture_unit);
 void pgraph_gl_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
 void pgraph_gl_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface);
+bool pgraph_gl_download_surfaces_in_range_if_dirty(NV2AState *d,
+                                                   hwaddr start,
+                                                   hwaddr size);
 SurfaceBinding *pgraph_gl_surface_get(NV2AState *d, hwaddr addr);
 SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *e);

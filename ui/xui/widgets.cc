@@ -53,7 +53,7 @@ void SectionTitle(const char *title)
 }
 
 float GetWidgetTitleDescriptionHeight(const char *title,
-                                      const char *description)
+                                      const char *description, float width)
 {
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
     float h = ImGui::GetFrameHeight();
@@ -63,7 +63,8 @@ float GetWidgetTitleDescriptionHeight(const char *title,
         ImGuiStyle &style = ImGui::GetStyle();
         h += style.ItemInnerSpacing.y;
         ImGui::PushFont(g_font_mgr.m_default_font);
-        h += ImGui::GetTextLineHeight();
+        float wrap_width = width - 2.0f * style.FramePadding.x;
+        h += ImGui::CalcTextSize(description, nullptr, false, wrap_width).y;
         ImGui::PopFont();
     }
 
@@ -71,7 +72,7 @@ float GetWidgetTitleDescriptionHeight(const char *title,
 }
 
 void WidgetTitleDescription(const char *title, const char *description,
-                            ImVec2 pos)
+                            ImVec2 pos, float width)
 {
     ImDrawList *draw_list = ImGui::GetWindowDrawList();
     ImGuiStyle &style = ImGui::GetStyle();
@@ -89,7 +90,11 @@ void WidgetTitleDescription(const char *title, const char *description,
         text_pos.y += title_height + style.ItemInnerSpacing.y;
 
         ImGui::PushFont(g_font_mgr.m_default_font);
-        draw_list->AddText(text_pos, ImGui::GetColorU32(ImVec4(0.94f, 0.94f, 0.94f, 0.70f)), description);
+        float wrap_width = width - 2.0f * style.FramePadding.x;
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(), text_pos,
+                           ImGui::GetColorU32(
+                               ImVec4(0.94f, 0.94f, 0.94f, 0.70f)),
+                           description, nullptr, wrap_width);
         ImGui::PopFont();
     }
 }
@@ -97,9 +102,10 @@ void WidgetTitleDescription(const char *title, const char *description,
 void WidgetTitleDescriptionItem(const char *str_id, const char *description)
 {
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImVec2 size(ImGui::GetColumnWidth(),
-                GetWidgetTitleDescriptionHeight(str_id, description));
-    WidgetTitleDescription(str_id, description, p);
+    float width = ImGui::GetColumnWidth();
+    ImVec2 size(width,
+                GetWidgetTitleDescriptionHeight(str_id, description, width));
+    WidgetTitleDescription(str_id, description, p, width);
 
     // XXX: Internal API
     ImRect bb(p, ImVec2(p.x + size.x, p.y + size.y));
@@ -196,8 +202,9 @@ bool Toggle(const char *str_id, bool *v, const char *description)
     ImGui::PopFont();
 
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImVec2 bb(ImGui::GetColumnWidth(),
-              GetWidgetTitleDescriptionHeight(str_id, description));
+    float width = ImGui::GetColumnWidth();
+    ImVec2 bb(width,
+              GetWidgetTitleDescriptionHeight(str_id, description, width));
     ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0, 0));
     ImGui::PushID(str_id);
     bool status = ImGui::Button("###toggle_button", bb);
@@ -209,7 +216,7 @@ bool Toggle(const char *str_id, bool *v, const char *description)
     const ImVec2 p_min = ImGui::GetItemRectMin();
     const ImVec2 p_max = ImGui::GetItemRectMax();
 
-    WidgetTitleDescription(str_id, description, p);
+    WidgetTitleDescription(str_id, description, p, width);
 
     float toggle_height = title_height * 0.9;
     ImVec2 toggle_size(toggle_height * 1.75, toggle_height);
@@ -234,9 +241,10 @@ void Slider(const char *str_id, float *v, const char *description)
     ImGui::PopFont();
 
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImVec2 size(ImGui::GetColumnWidth(),
-                GetWidgetTitleDescriptionHeight(str_id, description));
-    WidgetTitleDescription(str_id, description, p);
+    float width = ImGui::GetColumnWidth();
+    ImVec2 size(width,
+                GetWidgetTitleDescriptionHeight(str_id, description, width));
+    WidgetTitleDescription(str_id, description, p, width);
 
     // XXX: Internal API
     ImVec2 wpos = ImGui::GetCursorPos();
@@ -307,8 +315,8 @@ void FilePicker(const char *str_id, const char *current_path,
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     const char *desc = (current_path && strlen(current_path)) ? current_path : "(None Selected)";
-    ImVec2 bb(ImGui::GetColumnWidth(),
-              GetWidgetTitleDescriptionHeight(str_id, desc));
+    float width = ImGui::GetColumnWidth();
+    ImVec2 bb(width, GetWidgetTitleDescriptionHeight(str_id, desc, width));
     ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0, 0));
     ImGui::PushID(str_id);
     bool status =
@@ -324,7 +332,7 @@ void FilePicker(const char *str_id, const char *current_path,
     ImGui::PopID();
     ImGui::PopStyleVar();
 
-    WidgetTitleDescription(str_id, desc, p);
+    WidgetTitleDescription(str_id, desc, p, width);
 
     const ImVec2 p0 = ImGui::GetItemRectMin();
     const ImVec2 p1 = ImGui::GetItemRectMax();
@@ -383,8 +391,9 @@ void PrepareComboTitleDescription(const char *label, const char *description,
 {
     float width = ImGui::GetColumnWidth();
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImVec2 size(width, GetWidgetTitleDescriptionHeight(label, description));
-    WidgetTitleDescription(label, description, pos);
+    ImVec2 size(width,
+                GetWidgetTitleDescriptionHeight(label, description, width));
+    WidgetTitleDescription(label, description, pos, width);
 
     ImVec2 wpos = ImGui::GetCursorPos();
     ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
@@ -398,7 +407,8 @@ void PrepareComboTitleDescription(const char *label, const char *description,
 
 bool ChevronCombo(const char *label, int *current_item,
                   bool (*items_getter)(void *, int, const char **), void *data,
-                  int items_count, const char *description)
+                  int items_count, const char *description,
+                  ChevronComboItemEnabled item_enabled)
 {
     bool value_changed = false;
     float combo_width = ImGui::GetColumnWidth();
@@ -429,11 +439,14 @@ bool ChevronCombo(const char *label, int *current_item,
             const char* item_text;
             if (!items_getter(data, i, &item_text))
                 item_text = "*Unknown item*";
-            if (ImGui::Selectable(item_text, item_selected))
+            bool enabled = !item_enabled || item_enabled(i);
+            ImGui::BeginDisabled(!enabled);
+            if (ImGui::Selectable(item_text, item_selected) && enabled)
             {
                 value_changed = true;
                 *current_item = i;
             }
+            ImGui::EndDisabled();
             if (item_selected)
                 ImGui::SetItemDefaultFocus();
             ImGui::PopID();
@@ -473,7 +486,10 @@ static bool Items_SingleStringGetter(void* data, int idx, const char** out_text)
 }
 
 // Combo box helper allowing to pass all items in a single string literal holding multiple zero-terminated items "item1\0item2\0"
-bool ChevronCombo(const char* label, int* current_item, const char* items_separated_by_zeros, const char *description)
+bool ChevronCombo(const char *label, int *current_item,
+                  const char *items_separated_by_zeros,
+                  const char *description,
+                  ChevronComboItemEnabled item_enabled)
 {
     int items_count = 0;
     const char* p = items_separated_by_zeros;       // FIXME-OPT: Avoid computing this, or at least only when combo is open
@@ -484,7 +500,8 @@ bool ChevronCombo(const char* label, int* current_item, const char* items_separa
     }
     bool value_changed = ChevronCombo(
         label, current_item, Items_SingleStringGetter,
-        (void *)items_separated_by_zeros, items_count, description);
+        (void *)items_separated_by_zeros, items_count, description,
+        item_enabled);
     return value_changed;
 }
 

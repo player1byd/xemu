@@ -79,7 +79,7 @@ static void pgraph_null_flush_draw(NV2AState *d)
 
 static void pgraph_null_get_report(NV2AState *d, uint32_t parameter)
 {
-    pgraph_write_zpass_pixel_cnt_report(d, parameter, 0);
+    pgraph_write_zpass_pixel_cnt_report(d, d->pgraph.dma_report, parameter, 0);
 }
 
 static void pgraph_null_image_blit(NV2AState *d)

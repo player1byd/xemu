@@ -916,14 +916,18 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  */
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
 {
-    int mmu_idx;
+    MMUIdxMap work;
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+    work = cpu->neg.tlb.c.dirty;
+    while (work) {
+        int mmu_idx = ctz32(work);
         CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
         CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
         unsigned int n = tlb_n_entries(fast);
         unsigned int i;
+
+        work &= work - 1;
 
         for (i = 0; i < n; i++) {
             tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i],
@@ -951,19 +955,20 @@ static inline void tlb_set_dirty1_locked(CPUTLBEntry *tlb_entry,
    so that it is no longer dirty */
 static void tlb_set_dirty(CPUState *cpu, vaddr addr)
 {
-    int mmu_idx;
+    MMUIdxMap work;
 
     assert_cpu_is_self(cpu);
 
     addr &= TARGET_PAGE_MASK;
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-        tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
-    }
+    work = cpu->neg.tlb.c.dirty;
+    while (work) {
+        int mmu_idx = ctz32(work);
 
-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-        int k;
-        for (k = 0; k < CPU_VTLB_SIZE; k++) {
+        work &= work - 1;
+        tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
+
+        for (int k = 0; k < CPU_VTLB_SIZE; k++) {
             tlb_set_dirty1_locked(&cpu->neg.tlb.d[mmu_idx].vtable[k], addr);
         }
     }
@@ -1036,6 +1041,11 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     assert_cpu_is_self(cpu);
 
+#ifdef XBOX
+    full->code_dirty_word = NULL;
+    full->code_dirty_mask = 0;
+#endif
+
     if (full->lg_page_size <= TARGET_PAGE_BITS) {
         sz = TARGET_PAGE_SIZE;
     } else {
@@ -1083,8 +1093,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (physical_memory_is_clean(iotlb)) {
-                write_flags |= TLB_NOTDIRTY;
+            } else {
+#ifdef XBOX
+                physical_memory_get_dirty_word(iotlb, DIRTY_MEMORY_CODE,
+                                               &full->code_dirty_word,
+                                               &full->code_dirty_mask);
+#endif
+                if (physical_memory_is_clean(iotlb)) {
+                    write_flags |= TLB_NOTDIRTY;
+                }
             }
         }
     } else {
@@ -1104,9 +1121,11 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     wp_flags = cpu_watchpoint_address_matches(cpu, addr_page,
                                               TARGET_PAGE_SIZE);
 #ifdef XBOX
+    full->mem_access_callback = NULL;
     wp_flags |= mem_access_callback_address_matches(cpu,
                                                     iotlb & TARGET_PAGE_MASK,
-                                                    TARGET_PAGE_SIZE);
+                                                    TARGET_PAGE_SIZE,
+                                                    &full->mem_access_callback);
 #endif
 
     index = tlb_index(cpu, mmu_idx, addr_page);
@@ -1341,10 +1360,13 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
                            CPUTLBEntryFull *full, uintptr_t retaddr)
 {
     ram_addr_t ram_addr = mem_vaddr + full->xlat_section;
+    bool code_dirty;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
-    if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+    assert(full->code_dirty_word != NULL);
+    code_dirty = qatomic_read(full->code_dirty_word) & full->code_dirty_mask;
+    if (!code_dirty) {
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
 
@@ -1352,10 +1374,15 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
      * Set both VGA and migration bits for simplicity and to remove
      * the notdirty callback faster.
      */
-    physical_memory_set_dirty_range(ram_addr, size, DIRTY_CLIENTS_NOCODE);
+    physical_memory_set_dirty_range_nocode(ram_addr, size);
 
-    /* We remove the notdirty callback only if the code has been flushed. */
-    if (!physical_memory_is_clean(ram_addr)) {
+    /*
+     * The other clients were just dirtied, so only code can be clean.
+     * A concurrent client clear rearms the TLB through
+     * physical_memory_dirty_bits_cleared().
+     */
+    code_dirty = qatomic_read(full->code_dirty_word) & full->code_dirty_mask;
+    if (code_dirty) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
         tlb_set_dirty(cpu, mem_vaddr);
     }
@@ -1952,7 +1979,8 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 static uint64_t int_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
                                 uint64_t ret_be, vaddr addr, int size,
                                 int mmu_idx, MMUAccessType type, uintptr_t ra,
-                                MemoryRegion *mr, hwaddr mr_offset)
+                                MemoryRegion *mr, hwaddr mr_offset,
+                                bool bypass_reentrancy_guard)
 {
     do {
         MemOp this_mop;
@@ -1965,8 +1993,13 @@ static uint64_t int_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
         this_size = 1 << this_mop;
         this_mop |= MO_BE;
 
-        r = memory_region_dispatch_read(mr, mr_offset, &val,
-                                        this_mop, full->attrs);
+        if (bypass_reentrancy_guard) {
+            r = memory_region_dispatch_read_lockless(
+                mr, mr_offset, &val, this_mop, full->attrs);
+        } else {
+            r = memory_region_dispatch_read(mr, mr_offset, &val,
+                                            this_mop, full->attrs);
+        }
         if (unlikely(r != MEMTX_OK)) {
             io_failed(cpu, full, addr, this_size, type, mmu_idx, r, ra);
         }
@@ -1998,9 +2031,20 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
 
+    if (mr->lockless_io) {
+        return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
+                               type, ra, mr, mr_offset, false);
+    }
+
+    if (mr->lockless_read &&
+        mr->lockless_read(mr->opaque, mr_offset, size)) {
+        return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
+                               type, ra, mr, mr_offset, true);
+    }
+
     BQL_LOCK_GUARD();
     return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
-                           type, ra, mr, mr_offset);
+                           type, ra, mr, mr_offset, false);
 }
 
 static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
@@ -2019,11 +2063,20 @@ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
 
+    if (mr->lockless_io) {
+        a = int_ld_mmio_beN(cpu, full, ret_be, addr, size - 8, mmu_idx,
+                            MMU_DATA_LOAD, ra, mr, mr_offset, false);
+        b = int_ld_mmio_beN(cpu, full, ret_be, addr + size - 8, 8, mmu_idx,
+                            MMU_DATA_LOAD, ra, mr, mr_offset + size - 8,
+                            false);
+        return int128_make128(b, a);
+    }
+
     BQL_LOCK_GUARD();
     a = int_ld_mmio_beN(cpu, full, ret_be, addr, size - 8, mmu_idx,
-                        MMU_DATA_LOAD, ra, mr, mr_offset);
+                        MMU_DATA_LOAD, ra, mr, mr_offset, false);
     b = int_ld_mmio_beN(cpu, full, ret_be, addr + size - 8, 8, mmu_idx,
-                        MMU_DATA_LOAD, ra, mr, mr_offset + size - 8);
+                        MMU_DATA_LOAD, ra, mr, mr_offset + size - 8, false);
     return int128_make128(b, a);
 }
 

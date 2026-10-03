@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "source": "2026-09-19 XISO, two runs per role, same suite leaf ID/revision/iteration contract",
+  "metric": "Raw guest average microseconds per leaf; performance speedups withdrawn.",
+  "limits": "Functional outcomes only. Timing comparison withdrawn because settings differed, markers were missing, runs were grouped by role, and upstream terminated early.",
+  "leaf_count": 152,
+  "comparisons": {
+    "main_vs_upstream": {
+      "status_counts": {
+        "comparable": 29,
+        "not_reached": 117,
+        "hash_mismatch": 4,
+        "functional_failure": 2
+      },
+      "comparable_leaf_count": 29,
+      "performance_valid": false
+    },
+    "candidate_vs_main": {
+      "status_counts": {
+        "comparable": 150,
+        "hash_mismatch": 2
+      },
+      "comparable_leaf_count": 150,
+      "performance_valid": false
+    }
+  },
+  "performance_valid": false,
+  "performance_invalid_reason": "XISO runner omitted fork Advanced settings; candidate and main used different defaults. Live guest markers were unavailable."
+}

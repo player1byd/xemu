@@ -45,6 +45,13 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PGRAPH;
     }
 
+    /* PTIMER */
+    if (d->ptimer.pending_interrupts & d->ptimer.enabled_interrupts) {
+        d->pmc.pending_interrupts |= NV_PMC_INTR_0_PTIMER;
+    } else {
+        d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PTIMER;
+    }
+
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
         trace_nv2a_irq(d->pmc.pending_interrupts);
         pci_irq_assert(PCI_DEVICE(d));
@@ -135,6 +142,13 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     ENTRY(USER,     user,     0x800000, 0x800000),
 };
 #undef ENTRY
+
+static bool pgraph_lockless_read(void *opaque, hwaddr addr,
+                                 unsigned int size)
+{
+    (void)opaque;
+    return addr == NV_PGRAPH_PATT_COLOR0 && size == sizeof(uint32_t);
+}
 
 static int nv2a_get_bpp(VGACommonState *s)
 {
@@ -230,6 +244,7 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A);
     memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A_TEX);
+    memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A_SURFACE);
     memory_region_set_dirty(d->vram, 0, memory_region_size(d->vram));
 
     pgraph_init(d);
@@ -300,6 +315,8 @@ static void nv2a_reset(NV2AState *d)
     memset(d->pfifo.regs, 0, sizeof(d->pfifo.regs));
     memset(d->pgraph.regs_, 0, sizeof(d->pgraph.regs_));
     memset(d->pvideo.regs, 0, sizeof(d->pvideo.regs));
+    pgraph_uniform_input_touch_stages(
+        &d->pgraph, PGRAPH_UNIFORM_STAGE_MASK_BOTH);
 
     d->pcrtc.start = 0;
     d->pramdac.core_clock_coeff = 0x00011C01; /* 189MHz...? */
@@ -320,6 +337,7 @@ static void nv2a_reset(NV2AState *d)
     d->pmc.pending_interrupts = 0;
     d->pfifo.pending_interrupts = 0;
     d->ptimer.pending_interrupts = 0;
+    ptimer_reset(d);
     d->pcrtc.pending_interrupts = 0;
 
     for (int i = 0; i < 256; i++) {
@@ -349,6 +367,10 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
         memory_region_init_io(&d->block_mmio[i], OBJECT(dev),
                               &blocktable[i].ops, d,
                               blocktable[i].name, blocktable[i].size);
+        if (i == NV_PGRAPH) {
+            memory_region_set_lockless_read(&d->block_mmio[i],
+                                            pgraph_lockless_read);
+        }
         memory_region_add_subregion(&d->mmio, blocktable[i].offset,
                                     &d->block_mmio[i]);
     }
@@ -421,12 +443,36 @@ static int nv2a_pre_load(void *opaque)
 {
     NV2AState *d = opaque;
     nv2a_lock_fifo(d);
+    /* Clear timer fields omitted by pre-v4 streams and stale host callbacks. */
+    ptimer_reset(d);
     return 0;
 }
 
 static int nv2a_post_load(void *opaque, int version_id)
 {
     NV2AState *d = opaque;
+
+    ptimer_post_load(d, version_id);
+
+    /*
+     * Host renderer allocations are not part of VMState. Ensure that the
+     * restored guest constants are copied to the active Vulkan allocation.
+     */
+    pgraph_uniform_dirty_rows_invalidate(
+        d->pgraph.vsh_constants_dirty, &d->pgraph.vsh_rows_dirty_any,
+        NV2A_VERTEXSHADER_CONSTANTS);
+    pgraph_uniform_dirty_rows_invalidate(d->pgraph.ltctxa_dirty,
+                                         &d->pgraph.vsh_rows_dirty_any,
+                                         NV2A_LTCTXA_COUNT);
+    pgraph_uniform_dirty_rows_invalidate(d->pgraph.ltctxb_dirty,
+                                         &d->pgraph.vsh_rows_dirty_any,
+                                         NV2A_LTCTXB_COUNT);
+    pgraph_uniform_dirty_rows_invalidate(d->pgraph.ltc1_dirty,
+                                         &d->pgraph.vsh_rows_dirty_any,
+                                         NV2A_LTC1_COUNT);
+    pgraph_uniform_input_touch_stages(
+        &d->pgraph, PGRAPH_UNIFORM_STAGE_MASK_BOTH);
+    pgraph_invalidate_all_register_hints(&d->pgraph);
     qatomic_set(&d->pgraph.flush_pending, true);
     nv2a_unlock_fifo(d);
     return 0;
@@ -444,7 +490,7 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
 
 static const VMStateDescription vmstate_nv2a = {
     .name = "nv2a",
-    .version_id = 3,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_save = nv2a_post_save,
     .post_load = nv2a_post_load,
@@ -549,7 +595,7 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_UINT32(ptimer.enabled_interrupts, NV2AState),
         VMSTATE_UINT32(ptimer.numerator, NV2AState),
         VMSTATE_UINT32(ptimer.denominator, NV2AState),
-        VMSTATE_UINT32(ptimer.alarm_time, NV2AState),
+        VMSTATE_UNUSED(4),
         VMSTATE_UINT32_ARRAY(pfb.regs, NV2AState, 0x1000),
         VMSTATE_UINT32(pcrtc.pending_interrupts, NV2AState),
         VMSTATE_UINT32(pcrtc.enabled_interrupts, NV2AState),
@@ -564,6 +610,10 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
         VMSTATE_UNUSED(1),
         VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
+        VMSTATE_UINT64_V(ptimer.alarm_time, NV2AState, 4),
+        VMSTATE_UINT64_V(ptimer.time_offset, NV2AState, 4),
+        VMSTATE_TIMER_V(ptimer.timer, NV2AState, 4),
+        VMSTATE_BOOL_V(ptimer.alarm_armed, NV2AState, 5),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -615,5 +665,6 @@ void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram)
     NV2AState *d = NV2A_DEVICE(dev);
     nv2a_init_memory(d, ram);
     nv2a_init_vga(d);
+    ptimer_init(d);
     qemu_add_vm_change_state_handler(nv2a_vm_state_change, d);
 }

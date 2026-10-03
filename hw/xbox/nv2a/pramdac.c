@@ -94,10 +94,10 @@ void pramdac_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         p = (val & NV_PRAMDAC_NVPLL_COEFF_PDIV) >> 16;
 
         if (m == 0) {
-            d->pramdac.core_clock_freq = 0;
+            ptimer_set_core_clock(d, 0);
         } else {
-            d->pramdac.core_clock_freq = (NV2A_CRYSTAL_FREQ * n)
-                                          / (1 << p) / m;
+            ptimer_set_core_clock(d, (NV2A_CRYSTAL_FREQ * n)
+                                     / (1 << p) / m);
         }
 
         break;

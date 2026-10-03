@@ -17,6 +17,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
+#include "qemu/error-report.h"
+#include "ui/xemu-gpu-info.h"
 #include "renderer.h"
 #include <math.h>
 
@@ -198,7 +201,9 @@ static void upload_pvideo_image(PGRAPHState *pg, PvideoState state)
                                       VK_FORMAT_R8G8B8A8_UNORM,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    pgraph_vk_end_single_time_commands(
+        pg, cmd, VK_SINGLE_TIME_PVIDEO_UPLOAD,
+        (uint64_t)state.in_width * state.in_height * 4);
 }
 
 static const char *display_frag_glsl =
@@ -535,8 +540,25 @@ static void destroy_current_display_image(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
     PGRAPHVkDisplayState *d = &r->display;
 
+    d->reuse.valid = false;
+    pgraph_vk_host_copy_invalidate_upload(&d->host_copy.upload);
+
     if (d->image == VK_NULL_HANDLE) {
         return;
+    }
+
+    if (d->host_copy.gl_texture_id) {
+        glDeleteTextures(1, &d->host_copy.gl_texture_id);
+        d->host_copy.gl_texture_id = 0;
+    }
+
+    if (d->host_copy.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(r->allocator, d->host_copy.buffer,
+                         d->host_copy.allocation);
+        d->host_copy.buffer = VK_NULL_HANDLE;
+        d->host_copy.allocation = VK_NULL_HANDLE;
+        d->host_copy.mapped = NULL;
+        d->host_copy.size = 0;
     }
 
     destroy_frame_buffer(pg);
@@ -545,12 +567,16 @@ static void destroy_current_display_image(PGRAPHState *pg)
     glDeleteTextures(1, &d->gl_texture_id);
     d->gl_texture_id = 0;
 
-    glDeleteMemoryObjectsEXT(1, &d->gl_memory_obj);
-    d->gl_memory_obj = 0;
+    if (d->gl_memory_obj) {
+        glDeleteMemoryObjectsEXT(1, &d->gl_memory_obj);
+        d->gl_memory_obj = 0;
+    }
 
 #ifdef WIN32
-    CloseHandle(d->handle);
-    d->handle = 0;
+    if (d->handle) {
+        CloseHandle(d->handle);
+        d->handle = 0;
+    }
 #endif
 #endif
 
@@ -564,6 +590,32 @@ static void destroy_current_display_image(PGRAPHState *pg)
     d->memory = VK_NULL_HANDLE;
 
     d->draw_time = 0;
+}
+
+static void create_host_copy_buffer(PGRAPHState *pg, int width, int height)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    PGRAPHVkDisplayState *d = &r->display;
+    size_t size = (size_t)width * height * 4;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VmaAllocationCreateInfo allocation_info = {
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VmaAllocationInfo result = { 0 };
+
+    VK_CHECK(vmaCreateBuffer(r->allocator, &buffer_info, &allocation_info,
+                             &d->host_copy.buffer,
+                             &d->host_copy.allocation, &result));
+    assert(result.pMappedData != NULL);
+    d->host_copy.mapped = result.pMappedData;
+    d->host_copy.size = size;
 }
 
 // FIXME: We may need to use two images. One for actually rendering display,
@@ -582,20 +634,23 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     bool use_optimal_tiling = true;
 
 #if HAVE_EXTERNAL_MEMORY
-    GLint num_tiling_types;
-    glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
-                          GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
-    // XXX: Apparently on AMD GL_OPTIMAL_TILING_EXT is reported to be
-    // supported, but doesn't work? On nVidia, GL_LINEAR_TILING_EXT may not
-    // be supported so we must use optimal. Default to optimal unless
-    // linear is explicitly specified...
-    GLint tiling_types[num_tiling_types];
-    glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
-                          GL_TILING_TYPES_EXT, num_tiling_types, tiling_types);
-    for (int i = 0; i < num_tiling_types; i++) {
-        if (tiling_types[i] == GL_LINEAR_TILING_EXT) {
-            use_optimal_tiling = false;
-            break;
+    if (d->shared_presentation) {
+        GLint num_tiling_types;
+        glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
+                              GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
+        // XXX: Apparently on AMD GL_OPTIMAL_TILING_EXT is reported to be
+        // supported, but doesn't work? On nVidia, GL_LINEAR_TILING_EXT may
+        // not be supported so we must use optimal. Default to optimal unless
+        // linear is explicitly specified...
+        GLint tiling_types[num_tiling_types];
+        glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
+                              GL_TILING_TYPES_EXT, num_tiling_types,
+                              tiling_types);
+        for (int i = 0; i < num_tiling_types; i++) {
+            if (tiling_types[i] == GL_LINEAR_TILING_EXT) {
+                use_optimal_tiling = false;
+                break;
+            }
         }
     }
 #endif
@@ -612,7 +667,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .format = VK_FORMAT_R8G8B8A8_UNORM,
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 (d->shared_presentation ? 0 :
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT),
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
@@ -625,7 +683,9 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
 #endif
     };
-    image_create_info.pNext = &external_memory_image_create_info;
+    if (d->shared_presentation) {
+        image_create_info.pNext = &external_memory_image_create_info;
+    }
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -651,7 +711,9 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
             ,
     };
-    alloc_info.pNext = &export_memory_alloc_info;
+    if (d->shared_presentation) {
+        alloc_info.pNext = &export_memory_alloc_info;
+    }
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -670,6 +732,8 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                &d->image_view));
 
 #if HAVE_EXTERNAL_MEMORY
+
+    if (d->shared_presentation) {
 
 #ifdef WIN32
 
@@ -712,6 +776,15 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                          image_create_info.extent.width,
                          image_create_info.extent.height, d->gl_memory_obj, 0);
     assert(glGetError() == GL_NO_ERROR);
+
+    xemu_gpu_info_record_presentation(
+        XEMU_GPU_PRESENTATION_SHARED,
+        (const char *)glGetString(GL_VENDOR),
+        (const char *)glGetString(GL_RENDERER));
+    d->presentation_reported = true;
+    } else {
+        create_host_copy_buffer(pg, width, height);
+    }
 
 #endif // HAVE_EXTERNAL_MEMORY
 
@@ -774,10 +847,9 @@ static void update_descriptor_set(PGRAPHState *pg, SurfaceBinding *surface)
                            descriptor_writes, 0, NULL);
 }
 
-static PvideoState get_pvideo_state(PGRAPHState *pg)
+static bool is_pvideo_enabled(PGRAPHState *pg)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
-    PvideoState state;
 
     // FIXME: This check against PVIDEO_SIZE_IN does not match HW behavior.
     // Many games seem to pass this value when initializing or tearing down
@@ -788,8 +860,16 @@ static PvideoState get_pvideo_state(PGRAPHState *pg)
     // Since the value seems to be set to 0xFFFFFFFF only in cases where the
     // content is not valid, it is probably good enough to treat it as an
     // implicit stop.
-    state.enabled = (d->pvideo.regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE)
-        && d->pvideo.regs[NV_PVIDEO_SIZE_IN] != 0xFFFFFFFF;
+    return (d->pvideo.regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE) &&
+           d->pvideo.regs[NV_PVIDEO_SIZE_IN] != 0xFFFFFFFF;
+}
+
+static PvideoState get_pvideo_state(PGRAPHState *pg)
+{
+    NV2AState *d = container_of(pg, NV2AState, pgraph);
+    PvideoState state = { 0 };
+
+    state.enabled = is_pvideo_enabled(pg);
     if (!state.enabled) {
         return state;
     }
@@ -859,19 +939,17 @@ static PvideoState get_pvideo_state(PGRAPHState *pg)
     return state;
 }
 
-static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface)
+static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface,
+                            uint32_t vga_line_offset)
 {
-    NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
     ShaderUniformLayout *l = &r->display.display_frag->push_constants;
 
     int display_size_loc = uniform_index(l, "display_size");  // FIXME: Cache
     uniform2f(l, display_size_loc, r->display.width, r->display.height);
 
-    VGADisplayParams vga_display_params;
-    d->vga.get_params(&d->vga, &vga_display_params);
-    int line_offset = vga_display_params.line_offset ?
-                          surface->pitch / vga_display_params.line_offset :
+    int line_offset = vga_line_offset ?
+                          surface->pitch / vga_line_offset :
                           1;
     int line_offset_loc = uniform_index(l, "line_offset");
     uniform1f(l, line_offset_loc, line_offset);
@@ -895,7 +973,8 @@ static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface)
     }
 }
 
-static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
+static void render_display(PGRAPHState *pg, SurfaceBinding *surface,
+                           uint32_t vga_line_offset)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -906,14 +985,17 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
         pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
     }
 
-    pgraph_vk_upload_surface_data(d, surface, !tcg_enabled());
+    if (!pgraph_vk_upload_surface_data(d, surface, !tcg_enabled())) {
+        error_report("Vulkan display surface upload failed");
+        abort();
+    }
 
     disp->pvideo.state = get_pvideo_state(pg);
     if (disp->pvideo.state.enabled) {
         upload_pvideo_image(pg, disp->pvideo.state);
     }
 
-    update_uniforms(pg, surface);
+    update_uniforms(pg, surface, vga_line_offset);
     update_descriptor_set(pg, surface);
 
     VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
@@ -989,16 +1071,106 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
+#if HAVE_EXTERNAL_MEMORY
+    if (disp->shared_presentation) {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->image, VK_FORMAT_R8G8B8_UNORM,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->image, VK_FORMAT_R8G8B8_UNORM,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkBufferImageCopy region = {
+            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .imageSubresource.layerCount = 1,
+            .imageExtent = {
+                .width = disp->width,
+                .height = disp->height,
+                .depth = 1,
+            },
+        };
+        vkCmdCopyImageToBuffer(cmd, disp->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               disp->host_copy.buffer, 1, &region);
+
+        VkBufferMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = disp->host_copy.buffer,
+            .size = disp->host_copy.size,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1,
+                             &barrier, 0, NULL);
+    }
+#else
     pgraph_vk_transition_image_layout(pg, cmd, disp->image,
                                       VK_FORMAT_R8G8B8_UNORM,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+#endif
 
     pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    pgraph_vk_end_single_time_commands(
+        pg, cmd, VK_SINGLE_TIME_DISPLAY_RENDER, 0);
+#if HAVE_EXTERNAL_MEMORY
+    if (!disp->shared_presentation) {
+        VK_CHECK(vmaInvalidateAllocation(r->allocator,
+                                         disp->host_copy.allocation, 0,
+                                         disp->host_copy.size));
+    }
+#endif
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
 
     disp->draw_time = surface->draw_time;
+}
+
+static bool display_reuse_key_matches(PGRAPHVkDisplayState *disp,
+                                      SurfaceBinding *surface,
+                                      int guest_frame_time,
+                                      hwaddr scanout_address,
+                                      uint32_t vga_line_offset,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t surface_scale_factor,
+                                      uint8_t interlace_mode)
+{
+    return disp->reuse.valid &&
+           disp->reuse.surface_lifetime_id == surface->lifetime_id &&
+           disp->reuse.surface_draw_time == surface->draw_time &&
+           disp->reuse.guest_frame_time == guest_frame_time &&
+           disp->reuse.scanout_address == scanout_address &&
+           disp->reuse.vga_line_offset == vga_line_offset &&
+           disp->reuse.display_width == width &&
+           disp->reuse.display_height == height &&
+           disp->reuse.surface_scale_factor == surface_scale_factor &&
+           disp->reuse.interlace_mode == interlace_mode;
+}
+
+static void publish_display_reuse_key(PGRAPHVkDisplayState *disp,
+                                      SurfaceBinding *surface,
+                                      int guest_frame_time,
+                                      hwaddr scanout_address,
+                                      uint32_t vga_line_offset,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t surface_scale_factor,
+                                      uint8_t interlace_mode)
+{
+    disp->reuse.surface_lifetime_id = surface->lifetime_id;
+    disp->reuse.surface_draw_time = surface->draw_time;
+    disp->reuse.guest_frame_time = guest_frame_time;
+    disp->reuse.scanout_address = scanout_address;
+    disp->reuse.vga_line_offset = vga_line_offset;
+    disp->reuse.display_width = width;
+    disp->reuse.display_height = height;
+    disp->reuse.surface_scale_factor = surface_scale_factor;
+    disp->reuse.interlace_mode = interlace_mode;
+    disp->reuse.valid = true;
 }
 
 static void create_surface_sampler(PGRAPHState *pg)
@@ -1067,8 +1239,9 @@ void pgraph_vk_render_display(PGRAPHState *pg)
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
 
-    SurfaceBinding *surface = pgraph_vk_surface_get_within(
-        d, d->pcrtc.start + vga_display_params.line_offset);
+    hwaddr scanout_address =
+        d->pcrtc.start + vga_display_params.line_offset;
+    SurfaceBinding *surface = pgraph_vk_surface_get_within(d, scanout_address);
     if (surface == NULL || !surface->color || !surface->width ||
         !surface->height) {
         return;
@@ -1078,16 +1251,43 @@ void pgraph_vk_render_display(PGRAPHState *pg)
     d->vga.get_resolution(&d->vga, (int *)&width, (int *)&height);
 
     /* Adjust viewport height for interlaced mode, used only in 1080i */
-    if (d->vga.cr[NV_PRMCIO_INTERLACE_MODE] != NV_PRMCIO_INTERLACE_MODE_DISABLED) {
+    uint8_t interlace_mode = d->vga.cr[NV_PRMCIO_INTERLACE_MODE];
+    if (interlace_mode != NV_PRMCIO_INTERLACE_MODE_DISABLED) {
         height *= 2;
     }
 
     pgraph_apply_scaling_factor(pg, &width, &height);
 
     PGRAPHVkDisplayState *disp = &r->display;
+    bool recreated = false;
     if (!disp->image || disp->width != width || disp->height != height) {
         create_display_image(pg, width, height);
+        recreated = true;
     }
 
-    render_display(pg, surface);
+    bool pvideo_enabled = is_pvideo_enabled(pg);
+    bool reusable = tcg_enabled() && !pvideo_enabled &&
+                    !surface->upload_pending && !recreated;
+    if (reusable && display_reuse_key_matches(
+                        disp, surface, pg->frame_time, scanout_address,
+                        vga_display_params.line_offset, width, height,
+                        pg->surface_scale_factor, interlace_mode)) {
+        return;
+    }
+
+    disp->reuse.valid = false;
+    render_display(pg, surface, vga_display_params.line_offset);
+
+    /* The display submission and host-copy invalidation have completed. */
+    pgraph_vk_host_copy_publish_completed(
+        &disp->completed_output_generation, &disp->host_copy.upload);
+
+    /* render_display waits for the display image to be externally usable. */
+    if (tcg_enabled() && !disp->pvideo.state.enabled &&
+        !surface->upload_pending) {
+        publish_display_reuse_key(
+            disp, surface, pg->frame_time, scanout_address,
+            vga_display_params.line_offset, width, height,
+            pg->surface_scale_factor, interlace_mode);
+    }
 }

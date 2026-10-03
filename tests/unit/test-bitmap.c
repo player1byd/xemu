@@ -123,6 +123,42 @@ static void check_bitmap_set(void)
     bitmap_set_case(bitmap_set_atomic);
 }
 
+static void check_bitmap_take_masked_atomic(void)
+{
+    DECLARE_BITMAP(src, 2 * BITS_PER_LONG);
+    DECLARE_BITMAP(dst, 2 * BITS_PER_LONG);
+
+    bitmap_zero(src, 2 * BITS_PER_LONG);
+    bitmap_zero(dst, 2 * BITS_PER_LONG);
+    set_bit(BITS_PER_LONG - 2, src);
+    set_bit(BITS_PER_LONG, src);
+    set_bit(BITS_PER_LONG + 2, src);
+    set_bit(BITS_PER_LONG + 4, src);
+
+    g_assert(bitmap_take_and_clear_atomic(
+        dst, 7, src, BITS_PER_LONG - 2, 5));
+    g_assert(test_bit(7, dst));
+    g_assert(test_bit(9, dst));
+    g_assert(test_bit(11, dst));
+    g_assert(!test_bit(8, dst));
+    g_assert(!test_bit(10, dst));
+    g_assert(test_bit(BITS_PER_LONG + 4, src));
+    g_assert(!test_bit(BITS_PER_LONG - 2, src));
+    g_assert(!test_bit(BITS_PER_LONG, src));
+    g_assert(!test_bit(BITS_PER_LONG + 2, src));
+    g_assert(!bitmap_take_and_clear_atomic(
+        dst, 16, src, BITS_PER_LONG - 2, 5));
+
+    set_bit(10, src);
+    set_bit(11, src);
+    g_assert(bitmap_take_and_clear_atomic(
+        dst, BITS_PER_LONG - 1, src, 10, 2));
+    g_assert(test_bit(BITS_PER_LONG - 1, dst));
+    g_assert(test_bit(BITS_PER_LONG, dst));
+    g_assert(!test_bit(10, src));
+    g_assert(!test_bit(11, src));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -131,6 +167,8 @@ int main(int argc, char **argv)
                     check_bitmap_copy_with_offset);
     g_test_add_func("/bitmap/bitmap_set",
                     check_bitmap_set);
+    g_test_add_func("/bitmap/bitmap_take_masked_atomic",
+                    check_bitmap_take_masked_atomic);
 
     g_test_run();
 

@@ -33,6 +33,8 @@
 
 #include "xemu-controllers.h"
 #include "xemu-settings.h"
+#include "xemu-settings-migration.hh"
+#include "xemu-tweaks.h"
 
 #define DEFINE_CONFIG_TREE
 #include "xemu-config.h"
@@ -177,7 +179,9 @@ bool xemu_settings_load(void)
                 setlocale(LC_NUMERIC, "C");
 
                 try {
-                    config_tree.update_from_table(toml::parse(buf));
+                    toml::table table = toml::parse(buf);
+                    xemu_settings_apply_ubershader_migration(config_tree,
+                                                             table);
                     success = true;
                 } catch (const toml::parse_error& err) {
                    std::ostringstream oss;
@@ -226,6 +230,7 @@ void xemu_settings_save(void)
     // xemu_settings_load_gamepad_mapping should have migrated that setting to any connected
     // controller, so we can set it to true (default) now to remove it from the user config.
     g_config.input.allow_vibration = true;
+    g_config.tweaks.vk_hybrid_ubershaders = false;
 
     config_tree.update_from_struct(&g_config);
     fprintf(fd, "%s", config_tree.generate_delta_toml().c_str());
