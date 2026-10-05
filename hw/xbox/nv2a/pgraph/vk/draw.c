@@ -1208,6 +1208,7 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_FLIP_STALL] = NV2A_PROF_FINISH_FLIP_STALL,
     [VK_FINISH_REASON_FLUSH] = NV2A_PROF_FINISH_FLUSH,
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
+    [VK_FINISH_REASON_TEXTURE_DIRTY] = NV2A_PROF_FINISH_TEXTURE_DIRTY,
 };
 
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
@@ -1234,6 +1235,8 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                                 BUFFER_VERTEX_INLINE);
         sync_staging_buffer(pg, cmd, BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM);
         bitmap_clear(r->uploaded_bitmap, 0, r->bitmap_size);
+        r->num_vertex_ram_referenced = 0;
+        r->vertex_ram_referenced_overflowed = false;
         flush_memory_buffer(pg, cmd);
         VK_CHECK(vkEndCommandBuffer(r->aux_command_buffer));
         r->in_aux_command_buffer = false;
@@ -1445,9 +1448,15 @@ static void begin_draw(PGRAPHState *pg)
                      vp_height = pg->surface_binding_dim.height;
         pgraph_apply_scaling_factor(pg, &vp_width, &vp_height);
 
+        float vp_offset = pg->surface_scale_factor > 1
+                          ? 0.5f * (pg->surface_scale_factor - 1) + 0.25f
+                          : 0.0f;
+
         VkViewport viewport = {
-            .width = vp_width,
-            .height = vp_height,
+            .x = -vp_offset,
+            .y = -vp_offset,
+            .width = vp_width + vp_offset,
+            .height = vp_height + vp_offset,
             .minDepth = 0.0,
             .maxDepth = 1.0,
         };
@@ -1565,6 +1574,17 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
         return;
     }
 
+    /* Preserve the exact (unaligned) ranges before they are rounded out to page
+     * boundaries below. These are the bytes the upcoming draw will actually
+     * source vertices from, and are registered as referenced once this draw's
+     * own uploads are done.
+     */
+    MemorySyncRequirement precise[NV2A_VERTEXSHADER_ATTRIBUTES];
+    size_t num_precise = r->num_vertex_ram_buffer_syncs;
+
+    memcpy(precise, r->vertex_ram_buffer_syncs,
+           num_precise * sizeof(precise[0]));
+
     // Align sync requirements to page boundaries
     NV2A_VK_DGROUP_BEGIN("Sync vertex RAM buffer");
 
@@ -1635,6 +1655,15 @@ static void sync_vertex_ram_buffer(PGRAPHState *pg)
     }
 
     r->num_vertex_ram_buffer_syncs = 0;
+
+    /* Register after the uploads above: the draw that reads these bytes has not
+     * been recorded into the command buffer yet, so its own upload is not a
+     * conflict with itself.
+     */
+    for (size_t i = 0; i < num_precise; i++) {
+        pgraph_vk_mark_vertex_ram_referenced(pg, precise[i].addr,
+                                             precise[i].size);
+    }
 
     NV2A_VK_DGROUP_END();
 }
