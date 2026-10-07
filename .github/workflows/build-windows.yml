@@ -76,7 +76,7 @@ jobs:
         fi
         echo "XEMU_BUILD_OPTIONS=${opts[*]}" >> "$GITHUB_ENV"
     - name: Install Python requests
-      run: python3 -m pip install requests
+      run: python3 -m pip install --break-system-packages requests
     - name: Compile
       run: ./build.sh -p win64-cross ${XEMU_BUILD_OPTIONS}
     - name: Report ccache stats
