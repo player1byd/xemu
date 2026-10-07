@@ -2,6 +2,7 @@
  * DSP56300 disassembly routines
  *
  * Copyright (c) 2015 espes
+ * Copyright (c) 2026 Will Bonnett
  *
  * Adapted from Hatari DSP M56001 emulation
  * (C) 2003-2008 ARAnyM developer team
@@ -795,6 +796,14 @@ static void dis_do_aa(dsp_core_t* dsp)
     sprintf(dsp->disasm_str_instr,"do %s,p:$%04x",
         name,
         read_memory_p(dsp, dsp->pc+1)
+    );
+}
+static void dis_do_forever(dsp_core_t* dsp)
+{
+    dsp->disasm_cur_inst_len++;
+
+    sprintf(dsp->disasm_str_instr, "do forever,p:$%06x",
+        read_memory_p(dsp, dsp->pc + 1) & BITMASK(24)
     );
 }
 

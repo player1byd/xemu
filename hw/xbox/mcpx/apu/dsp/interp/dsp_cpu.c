@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2015 espes
  * Copyright (c) 2020-2025 Matt Borgerson
+ * Copyright (c) 2026 Will Bonnett
  *
  * Adapted from Hatari DSP M56001 emulation
  * (C) 2003-2008 ARAnyM developer team
@@ -28,6 +29,8 @@
 #include "dsp_cpu.h"
 #include "debug.h"
 #include "trace.h"
+#include "dsp.h"
+#include "ep_yrom.h"
 
 #define BITMASK(x)  ((1<<(x))-1)
 
@@ -63,6 +66,8 @@ static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value);
 static void dsp_stack_push(dsp_core_t* dsp, uint32_t curpc, uint32_t cursr, uint16_t sshOnly);
 static void dsp_stack_pop(dsp_core_t* dsp, uint32_t *curpc, uint32_t *cursr);
 static void dsp_compute_ssh_ssl(dsp_core_t* dsp);
+void dsp_stack_push_ssh(dsp_core_t* dsp, uint32_t value);
+uint32_t dsp_stack_pop_ssh(dsp_core_t* dsp);
 
 /* 56bits arithmetic */
 static uint16_t dsp_abs56(uint32_t *dest);
@@ -110,20 +115,20 @@ static const int registers_mask[64] = {
     24, 24, 8, 8,
     24, 24, 24, 24,
 
-    16, 16, 16, 16,
-    16, 16, 16, 16,
-    16, 16, 16, 16,
-    16, 16, 16, 16,
+    24, 24, 24, 24,
+    24, 24, 24, 24,
+    24, 24, 24, 24,
+    24, 24, 24, 24,
 
-    16, 16, 16, 16,
-    16, 16, 16, 16,
+    24, 24, 24, 24,
+    24, 24, 24, 24,
     0, 0, 0, 0,
     0, 0, 0, 0,
 
     0, 0, 0, 0,
     0, 0, 0, 0,
-    0, 16, 8, 6,
-    16, 16, 16, 16
+    0, 24, 8, 6,
+    24, 24, 24, 24
 };
 
 #include "dsp_emu.c.inc"
@@ -225,7 +230,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000011000aaaaaa0S000000", "do [X or Y]:aa, expr", dis_do_aa, emu_do_aa },
     { "00000110iiiiiiii1000hhhh", "do #xxx, expr", dis_do_imm, emu_do_imm },
     { "0000011011DDDDDD00000000", "do S, expr", dis_do_reg, emu_do_reg },
-    { "000000000000001000000011", "do_f", NULL, NULL },
+    { "000000000000000100000000", "do forever, expr", dis_do_forever, emu_do_forever },
     { "0000011001MMMRRR0S010000", "dor [X or Y]:ea, label", NULL, NULL, match_MMMRRR },
     { "0000011000aaaaaa0S010000", "dor [X or Y]:aa, label", NULL, NULL },
     { "00000110iiiiiiii1001hhhh", "dor #xxx, label", dis_dor_imm, emu_dor_imm },
@@ -379,7 +384,7 @@ void dsp56k_reset_cpu(dsp_core_t* dsp)
     dsp->pc = 0x0000;
     dsp->registers[DSP_REG_OMR]=0x02;
     for (i=0;i<8;i++) {
-        dsp->registers[DSP_REG_M0+i]=0x00ffff;
+        dsp->registers[DSP_REG_M0+i]=0xffffff;
     }
 
     /* Interruptions */
@@ -395,6 +400,14 @@ void dsp56k_reset_cpu(dsp_core_t* dsp)
 
     /* Misc */
     dsp->loop_rep = 0;
+    dsp->is_idle = false;
+    dsp->cycle_count = 0;
+    dsp->spin_count = 0;
+    dsp->last_spin_pc = 0xFFFFFFFF;
+    if (dsp->opaque) {
+        dsp_set_halt_requested((DSPState *)dsp->opaque, false);
+    }
+    memset(dsp->predecode_table, 0, sizeof(dsp->predecode_table));
 
 
     /* runtime shit */
@@ -588,24 +601,59 @@ static const char* disasm_get_instruction_text(dsp_core_t* dsp)
     return dsp->disasm_str_instr2;
 }
 
+const dsp_decoded_op_t *dsp_predecode_word(dsp_core_t *dsp, uint32_t pc)
+{
+    uint32_t idx = pc & (DSP_PRAM_SIZE - 1);
+    uint32_t inst = dsp->pram[idx];
+    dsp_decoded_op_t *op = &dsp->predecode_table[idx];
+
+    *op = (dsp_decoded_op_t){0};
+
+    if (inst >= 0x100000) {
+        op->flags = DSP_OP_FLAG_VALID | DSP_OP_FLAG_PARALLEL;
+        op->inst_len = 1;
+        op->instr_cycle = 2;
+        op->ea_mode = (inst >> 8) & 0x3F;
+        op->alu_handler = opcodes_alu[inst & 0xFF];
+        op->handler = (dsp_exec_fn_t)(void *)opcodes_parmove[(inst >> 20) & 0xF];
+    } else {
+        const OpcodeEntry *entry = lookup_opcode(inst);
+        if (entry && entry->emu_func) {
+            op->handler = (dsp_exec_fn_t)(void *)entry->emu_func;
+        } else {
+            op->handler = (dsp_exec_fn_t)(void *)emu_undefined;
+        }
+        op->flags = DSP_OP_FLAG_VALID;
+        op->inst_len = 1;
+        op->instr_cycle = 2;
+    }
+
+    if (!dsp->is_gp) {
+        op->flags |= DSP_OP_FLAG_IMMUTABLE;
+    }
+
+    return op;
+}
+
 void dsp56k_execute_instruction(dsp_core_t* dsp)
 {
+    uint32_t entry_pc = dsp->pc;
     trace_dsp56k_execute_instruction(dsp->is_gp, dsp->pc);
-
-    uint32_t disasm_return = 0;
     dsp->disasm_memory_ptr = 0;
 
-    /* Decode and execute current instruction */
-    dsp->cur_inst = read_memory_p(dsp, dsp->pc);
+    const dsp_decoded_op_t *op = &dsp->predecode_table[dsp->pc];
+    if (__builtin_expect(!(op->flags & DSP_OP_FLAG_VALID), 0)) {
+        op = dsp_predecode_word(dsp, dsp->pc);
+    }
 
-    /* Initialize instruction size and cycle counter */
-    dsp->cur_inst_len = 1;
-    dsp->instr_cycle = 2;
+    /* Set current instruction word and default timing */
+    dsp->cur_inst = dsp->pram[dsp->pc];
+    dsp->cur_inst_len = op->inst_len;
+    dsp->instr_cycle = op->instr_cycle;
 
+    uint32_t disasm_return = 0;
     bool tracing = TRACE_DSP_DISASM || trace_event_get_state(TRACE_DSP56K_EXECUTE_INSTRUCTION_DISASM);
-
-    /* Disasm current instruction ? (trace mode only) */
-    if (tracing) {
+    if (__builtin_expect(tracing, 0)) {
         disasm_return = disasm_instruction(dsp, DSP_TRACE_MODE);
         if (disasm_return) {
             const char *text = disasm_get_instruction_text(dsp);
@@ -619,25 +667,11 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
         }
     }
 
-    if (dsp->cur_inst < 0x100000) {
-        const OpcodeEntry *op = dsp->pram_opcache[dsp->pc];
-        if (op == NULL) {
-            op = lookup_opcode(dsp->cur_inst);
-            dsp->pram_opcache[dsp->pc] = op;
-        }
-        if (op->emu_func) {
-            op->emu_func(dsp);
-        } else {
-            DPRINTF("%x - %s\n", dsp->cur_inst, op->name);
-            emu_undefined(dsp);
-        }
-    } else {
-        /* Do parallel move read */
-        opcodes_parmove[(dsp->cur_inst>>20) & BITMASK(4)](dsp);
-    }
+    /* Single flat dispatch for 100% of instructions */
+    op->handler(dsp, op);
 
     /* Disasm current instruction ? (trace mode only) */
-    if (tracing && disasm_return) {
+    if (__builtin_expect(tracing && disasm_return, 0)) {
         if (TRACE_DSP_DISASM_REG) {
             disasm_reg_compare(dsp);
         }
@@ -655,6 +689,25 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
 
     /* Process the PC */
     dsp_postexecute_update_pc(dsp);
+
+    /* Centralized Spin-Wait Evaluation */
+    if (dsp->pc == entry_pc && !dsp->loop_rep) {
+        if (entry_pc == dsp->last_spin_pc) {
+            dsp->spin_count++;
+            if (dsp->spin_count >= 4) {
+                dsp->is_idle = true;
+                if (dsp->opaque) {
+                    dsp_set_halt_requested((DSPState *)dsp->opaque, true);
+                }
+                dsp->spin_count = 0;
+            }
+        } else {
+            dsp->last_spin_pc = entry_pc;
+            dsp->spin_count = 1;
+        }
+    } else {
+        dsp->spin_count = 0;
+    }
 
     /* Process Interrupts */
     dsp_postexecute_interrupts(dsp);
@@ -713,20 +766,29 @@ static void dsp_postexecute_update_pc(dsp_core_t* dsp)
 
         /* Did we execute the last instruction in loop ? */
         if (dsp->pc == dsp->registers[DSP_REG_LA] + 1) {
-            --dsp->registers[DSP_REG_LC];
-            dsp->registers[DSP_REG_LC] &= BITMASK(16);
-
-            if (dsp->registers[DSP_REG_LC] == 0) {
-                /* end of loop */
-                uint32_t saved_pc, saved_sr;
-
-                dsp_stack_pop(dsp, &saved_pc, &saved_sr);
-                dsp->registers[DSP_REG_SR] &= 0x7f;
-                dsp->registers[DSP_REG_SR] |= saved_sr & (1<<DSP_SR_LF);
-                dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
+            /* Check if this is a DO FOREVER loop */
+            if (dsp->registers[DSP_REG_SR] & (1 << DSP_SR_FV)) {
+                /* Infinite loop: do not decrement LC. Jump back to loop start address in SSH */
+                dsp->pc = dsp->stack[0][dsp->registers[DSP_REG_SP] & DSP_SP_MASK];
             } else {
-                /* Loop one more time */
-                dsp->pc = dsp->registers[DSP_REG_SSH];
+                /* Standard DO loop: decrement LC */
+                dsp->registers[DSP_REG_LC] = (dsp->registers[DSP_REG_LC] - 1) & BITMASK(24);
+                if (dsp->registers[DSP_REG_LC] == 0) {
+                    /* Loop finished: pop Level 2 (PC, SR) */
+                    uint32_t saved_pc, saved_sr;
+
+                    dsp_stack_pop(dsp, &saved_pc, &saved_sr);
+
+                    /* Restore status flags */
+                    dsp->registers[DSP_REG_SR] &= ~((1 << DSP_SR_LF) | (1 << DSP_SR_FV));
+                    dsp->registers[DSP_REG_SR] |= saved_sr & ((1 << DSP_SR_LF) | (1 << DSP_SR_FV));
+
+                    /* Pop Level 1 (LA, LC) */
+                    dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
+                } else {
+                    /* Repeat loop */
+                    dsp->pc = dsp->stack[0][dsp->registers[DSP_REG_SP] & DSP_SP_MASK];
+                }
             }
         }
     }
@@ -747,6 +809,11 @@ void dsp56k_add_interrupt(dsp_core_t* dsp, uint16_t inter)
     if (dsp->interrupt_is_pending[inter] == 0) {
         dsp->interrupt_is_pending[inter] = 1;
         dsp->interrupt_counter ++;
+    }
+
+    dsp->is_idle = false;
+    if (dsp->opaque) {
+        dsp_set_halt_requested((DSPState *)dsp->opaque, false);
     }
 }
 
@@ -777,7 +844,7 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
                 if ( ((instr & 0xfff000) == 0x0d0000) || ((instr & 0xffc0ff) == 0x0bc080) ) {
                     dsp->interrupt_state = DSP_INTERRUPT_LONG;
                     dsp_stack_push(dsp, dsp->interrupt_save_pc, dsp->registers[DSP_REG_SR], 0);
-                    dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_LF)|(1<<DSP_SR_FV)  |
+                    dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_LF)|(1<<DSP_SR_FV)  |
                                             (1<<DSP_SR_S1)|(1<<DSP_SR_S0) |
                                             (1<<DSP_SR_I0)|(1<<DSP_SR_I1));
                     dsp->registers[DSP_REG_SR] |= dsp->interrupt_ipl_to_raise<<DSP_SR_I0;
@@ -791,7 +858,7 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
                     if ( ((instr & 0xfff000) == 0x0d0000) || ((instr & 0xffc0ff) == 0x0bc080) ) {
                         dsp->interrupt_state = DSP_INTERRUPT_LONG;
                         dsp_stack_push(dsp, dsp->interrupt_save_pc, dsp->registers[DSP_REG_SR], 0);
-                        dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_LF)|(1<<DSP_SR_FV)  |
+                        dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_LF)|(1<<DSP_SR_FV)  |
                                                 (1<<DSP_SR_S1)|(1<<DSP_SR_S0) |
                                                 (1<<DSP_SR_I0)|(1<<DSP_SR_I1));
                         dsp->registers[DSP_REG_SR] |= dsp->interrupt_ipl_to_raise<<DSP_SR_I0;
@@ -885,6 +952,14 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
  *  Read/Write memory functions
  **********************************/
 
+static inline bool dsp_core_is_gp(dsp_core_t *dsp)
+{
+    if (dsp->opaque) {
+        return ((DSPState *)dsp->opaque)->is_gp;
+    }
+    return dsp->is_gp;
+}
+
 static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
 {
     assert((address & 0xFF000000) == 0);
@@ -892,6 +967,26 @@ static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
     uint32_t r = ldl_le_p(&dsp->pram[address]);
     assert((r & 0xFF000000) == 0);
     return r;
+}
+
+static uint32_t read_memory_y(dsp_core_t* dsp, uint32_t address)
+{
+    assert((address & 0xFF000000) == 0);
+    if (address >= DSP_PERIPH_BASE) {
+        assert(dsp->read_peripheral);
+        return dsp->read_peripheral(dsp, address) & 0x00FFFFFF;
+    }
+    if (!dsp_core_is_gp(dsp)) {
+        if (address >= 0x0800 && address <= 0x0FFF) {
+            return ep_yrom[address - 0x0800] & 0x00FFFFFF;
+        }
+    }
+    if (address < DSP_YRAM_SIZE) {
+        return dsp->yram[address];
+    } else {
+        fprintf(stderr, "Out of bounds Y read at %x!\n", address);
+        return 0x00FFFFFF;
+    }
 }
 
 uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
@@ -906,17 +1001,18 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
             return dsp->mixbuffer[address-DSP_MIXBUFFER_BASE];
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
             return dsp->mixbuffer[address-0xc00];
+        } else if (address >= 0x4000 && address < 0x6000) {
+            return 0; /* EP external aperture read */
         } else {
             if (address < DSP_XRAM_SIZE) {
                 return dsp->xram[address];
             } else {
-                fprintf(stderr, "Out of bounds read at %x!\n", address);
+                DPRINTF("Out of bounds read at %x!\n", address);
                 return 0x00FFFFFF; // FIXME: What does the DSP actually do in this case?
             }
         }
     } else if (space == DSP_SPACE_Y) {
-        assert(address < DSP_YRAM_SIZE);
-        return dsp->yram[address];
+        return read_memory_y(dsp, address);
     } else if (space == DSP_SPACE_P) {
         return read_memory_p(dsp, address);
     } else {
@@ -947,17 +1043,40 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
             dsp->mixbuffer[address-DSP_MIXBUFFER_BASE] = value;
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
             dsp->mixbuffer[address-0xc00] = value;
+        } else if (address >= 0x4000 && address < 0x6000) {
+            /* EP external memory aperture write - safely accept */
+            return;
         } else {
-            assert(address < DSP_XRAM_SIZE);
-            dsp->xram[address] = value;
+            if (address < DSP_XRAM_SIZE) {
+                dsp->xram[address] = value;
+            } else {
+                DPRINTF("Out of bounds X write at %x! (val: 0x%06x)\n", address, value);
+            }
         }
     } else if (space == DSP_SPACE_Y) {
-        assert(address < DSP_YRAM_SIZE);
-        dsp->yram[address] = value;
+        if (address >= DSP_PERIPH_BASE) {
+            assert(dsp->write_peripheral);
+            dsp->write_peripheral(dsp, address, value);
+            return;
+        }
+        if (!dsp_core_is_gp(dsp) && address >= 0x0800 && address <= 0x0FFF) {
+            /* EP on-chip Y data ROM (read-only factory ROM) - drop write */
+            return;
+        }
+        if (address < DSP_YRAM_SIZE) {
+            dsp->yram[address] = value;
+        } else {
+            fprintf(stderr, "Out of bounds Y write at %x!\n", address);
+        }
     } else if (space == DSP_SPACE_P) {
         assert(address < DSP_PRAM_SIZE);
         stl_le_p(&dsp->pram[address], value);
-        dsp->pram_opcache[address] = NULL;
+        if (!(dsp->predecode_table[address].flags & DSP_OP_FLAG_IMMUTABLE)) {
+            dsp->predecode_table[address].flags = 0;
+            if (address > 0 && !(dsp->predecode_table[address - 1].flags & DSP_OP_FLAG_IMMUTABLE)) {
+                dsp->predecode_table[address - 1].flags = 0;
+            }
+        }
     } else {
         assert(!"Invalid dsp space in write raw memory");
     }
@@ -1017,7 +1136,7 @@ static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
             dsp->registers[DSP_REG_OMR] = value & 0xc7;
             break;
         case DSP_REG_SR:
-            dsp->registers[DSP_REG_SR] = value & 0xaf7f;
+            dsp->registers[DSP_REG_SR] = value & (0xaf7f | (1 << DSP_SR_FV));
             break;
         case DSP_REG_SP:
             stack_error = dsp->registers[DSP_REG_SP] & (3<<DSP_SP_SE);
@@ -1035,15 +1154,12 @@ static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
             dsp_compute_ssh_ssl(dsp);
             break;
         case DSP_REG_SSH:
-            dsp_stack_push(dsp, value, 0, 1);
+            dsp_stack_push_ssh(dsp, value);
             break;
         case DSP_REG_SSL:
             numreg = dsp->registers[DSP_REG_SP] & BITMASK(4);
-            if (numreg == 0) {
-                value = 0;
-            }
-            dsp->stack[1][numreg] = value & BITMASK(16);
-            dsp->registers[DSP_REG_SSL] = value & BITMASK(16);
+            dsp->stack[1][numreg] = value & BITMASK(24);
+            dsp->registers[DSP_REG_SSL] = value & BITMASK(24);
             break;
         default:
             dsp->registers[numreg] = value;
@@ -1056,6 +1172,18 @@ static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
  *  Stack push/pop
  **********************************/
 
+void dsp_stack_push_ssh(dsp_core_t* dsp, uint32_t value)
+{
+    dsp_stack_push(dsp, value, 0, 1);
+}
+
+uint32_t dsp_stack_pop_ssh(dsp_core_t* dsp)
+{
+    uint32_t value = 0, dummy = 0;
+    dsp_stack_pop(dsp, &value, &dummy);
+    return value;
+}
+
 static void dsp_stack_push(dsp_core_t* dsp, uint32_t curpc, uint32_t cursr, uint16_t sshOnly)
 {
     uint32_t stack_error, underflow, stack;
@@ -1063,7 +1191,6 @@ static void dsp_stack_push(dsp_core_t* dsp, uint32_t curpc, uint32_t cursr, uint
     stack_error = dsp->registers[DSP_REG_SP] & (1<<DSP_SP_SE);
     underflow = dsp->registers[DSP_REG_SP] & (1<<DSP_SP_UF);
     stack = (dsp->registers[DSP_REG_SP] & BITMASK(4)) + 1;
-
 
     if ((stack_error==0) && (stack & (1<<DSP_SP_SE))) {
         /* Stack full, raise interrupt */
@@ -1076,46 +1203,47 @@ static void dsp_stack_push(dsp_core_t* dsp, uint32_t curpc, uint32_t cursr, uint
     dsp->registers[DSP_REG_SP] = (underflow | stack_error | stack) & BITMASK(6);
     stack &= BITMASK(4);
 
-    if (stack) {
-        /* SSH part */
-        dsp->stack[0][stack] = curpc & BITMASK(16);
-        /* SSL part, if instruction is not like "MOVEC xx, SSH"  */
-        if (sshOnly == 0) {
-            dsp->stack[1][stack] = cursr & BITMASK(16);
-        }
-    } else {
-        dsp->stack[0][0] = 0;
-        dsp->stack[1][0] = 0;
+    /* SSH part */
+    dsp->stack[0][stack] = curpc & BITMASK(24);
+    /* SSL part, if instruction is not like "MOVEC xx, SSH" */
+    if (sshOnly == 0) {
+        dsp->stack[1][stack] = cursr & BITMASK(24);
     }
 
     /* Update SSH and SSL registers */
-    dsp->registers[DSP_REG_SSH] = dsp->stack[0][stack];
-    dsp->registers[DSP_REG_SSL] = dsp->stack[1][stack];
+    dsp->registers[DSP_REG_SSH] = dsp->stack[0][stack] & BITMASK(24);
+    dsp->registers[DSP_REG_SSL] = dsp->stack[1][stack] & BITMASK(24);
 }
 
 static void dsp_stack_pop(dsp_core_t* dsp, uint32_t *newpc, uint32_t *newsr)
 {
-    uint32_t stack_error, underflow, stack;
+    uint32_t stack_error, underflow, cur_stack, new_stack;
+
+    cur_stack = dsp->registers[DSP_REG_SP] & BITMASK(4);
+    if (newpc) {
+        *newpc = dsp->stack[0][cur_stack] & BITMASK(24);
+    }
+    if (newsr) {
+        *newsr = dsp->stack[1][cur_stack] & BITMASK(24);
+    }
 
     stack_error = dsp->registers[DSP_REG_SP] & (1<<DSP_SP_SE);
     underflow = dsp->registers[DSP_REG_SP] & (1<<DSP_SP_UF);
-    stack = (dsp->registers[DSP_REG_SP] & BITMASK(4)) - 1;
+    new_stack = cur_stack - 1;
 
-    if ((stack_error==0) && (stack & (1<<DSP_SP_SE))) {
-        /* Stack empty*/
+    if ((stack_error==0) && (new_stack & (1<<DSP_SP_SE))) {
+        /* Stack empty / underflow */
         dsp56k_add_interrupt(dsp, DSP_INTER_STACK_ERROR);
         DPRINTF("Dsp: Stack underflow\n");
         if (dsp->exception_debugging)
             assert(!"Dsp stack underflow");
     }
 
-    dsp->registers[DSP_REG_SP] = (underflow | stack_error | stack) & BITMASK(6);
-    stack &= BITMASK(4);
-    *newpc = dsp->registers[DSP_REG_SSH];
-    *newsr = dsp->registers[DSP_REG_SSL];
+    dsp->registers[DSP_REG_SP] = (underflow | stack_error | new_stack) & BITMASK(6);
+    new_stack &= BITMASK(4);
 
-    dsp->registers[DSP_REG_SSH] = dsp->stack[0][stack];
-    dsp->registers[DSP_REG_SSL] = dsp->stack[1][stack];
+    dsp->registers[DSP_REG_SSH] = dsp->stack[0][new_stack] & BITMASK(24);
+    dsp->registers[DSP_REG_SSL] = dsp->stack[1][new_stack] & BITMASK(24);
 }
 
 static void dsp_compute_ssh_ssl(dsp_core_t* dsp)
@@ -1124,8 +1252,8 @@ static void dsp_compute_ssh_ssl(dsp_core_t* dsp)
 
     stack = dsp->registers[DSP_REG_SP];
     stack &= BITMASK(4);
-    dsp->registers[DSP_REG_SSH] = dsp->stack[0][stack];
-    dsp->registers[DSP_REG_SSL] = dsp->stack[1][stack];
+    dsp->registers[DSP_REG_SSH] = dsp->stack[0][stack] & BITMASK(24);
+    dsp->registers[DSP_REG_SSL] = dsp->stack[1][stack] & BITMASK(24);
 }
 
 
@@ -1250,64 +1378,20 @@ static uint16_t dsp_sub56(uint32_t *source, uint32_t *dest)
 
 static void dsp_mul56(uint32_t source1, uint32_t source2, uint32_t *dest, uint8_t signe)
 {
-    uint32_t part[4], zerodest[3], value;
-
-    /* Multiply: D = S1*S2 */
-    if (source1 & (1<<23)) {
-        signe ^= 1;
-        source1 = (1<<24) - source1;
-    }
-    if (source2 & (1<<23)) {
-        signe ^= 1;
-        source2 = (1<<24) - source2;
-    }
-
-    /* bits 0-11 * bits 0-11 */
-    part[0]=(source1 & BITMASK(12))*(source2 & BITMASK(12));
-    /* bits 12-23 * bits 0-11 */
-    part[1]=((source1>>12) & BITMASK(12))*(source2 & BITMASK(12));
-    /* bits 0-11 * bits 12-23 */
-    part[2]=(source1 & BITMASK(12))*((source2>>12)  & BITMASK(12));
-    /* bits 12-23 * bits 12-23 */
-    part[3]=((source1>>12) & BITMASK(12))*((source2>>12) & BITMASK(12));
-
-    /* Calc dest 2 */
-    dest[2] = part[0];
-    dest[2] += (part[1] & BITMASK(12)) << 12;
-    dest[2] += (part[2] & BITMASK(12)) << 12;
-
-    /* Calc dest 1 */
-    dest[1] = (part[1]>>12) & BITMASK(12);
-    dest[1] += (part[2]>>12) & BITMASK(12);
-    dest[1] += part[3];
-
-    /* Calc dest 0 */
-    dest[0] = 0;
-
-    /* Add carries */
-    value = (dest[2]>>24) & BITMASK(8);
-    if (value) {
-        dest[1] += value;
-        dest[2] &= BITMASK(24);
-    }
-    value = (dest[1]>>24) & BITMASK(8);
-    if (value) {
-        dest[0] += value;
-        dest[1] &= BITMASK(24);
-    }
-
-    /* Get rid of extra sign bit */
-    dsp_asl56(dest, 1);
+    int64_t s1 = (int64_t)signextend24(source1);
+    int64_t s2 = (int64_t)signextend24(source2);
+    int64_t prod = s1 * s2;
 
     if (signe) {
-        zerodest[0] = zerodest[1] = zerodest[2] = 0;
-
-        dsp_sub56(dest, zerodest);
-
-        dest[0] = zerodest[0];
-        dest[1] = zerodest[1];
-        dest[2] = zerodest[2];
+        prod = -prod;
     }
+
+    /* Fractional multiplication: Q23 x Q23 -> Q46, left-shift 1 to Q47 */
+    uint64_t u_prod = (uint64_t)prod << 1;
+
+    dest[2] = (uint32_t)(u_prod & 0x00FFFFFF);
+    dest[1] = (uint32_t)((u_prod >> 24) & 0x00FFFFFF);
+    dest[0] = (uint32_t)((u_prod >> 48) & BITMASK(8));
 }
 
 static void dsp_rnd56(dsp_core_t* dsp, uint32_t *dest)
@@ -1353,6 +1437,9 @@ static void dsp_rnd56(dsp_core_t* dsp, uint32_t *dest)
 }
 
 static uint32_t dsp_signextend(int bits, uint32_t v) {
+    if (__builtin_expect(bits == 24, 1)) {
+        return (uint32_t)signextend24(v);
+    }
     const int shift = sizeof(int)*8 - bits;
     assert(shift > 0);
     return (uint32_t)(((int32_t)v << shift) >> shift);

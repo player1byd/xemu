@@ -15,6 +15,8 @@
  *
  * Contributions after 2012-01-13 are licensed under the terms of the
  * GNU GPL, version 2 or (at your option) any later version.
+ *
+ * Copyright (c) 2026 Will Bonnett
  */
 
 #include "qemu/osdep.h"
@@ -29,6 +31,7 @@
 #include "qemu/error-report.h"
 #include "ac97_int.h"
 #include "ac97.h"
+#include "hw/xbox/mcpx/aci.h"
 
 #define SOFT_VOLUME
 #define SR_FIFOE 16             /* rwc */
@@ -171,51 +174,38 @@ static void fetch_bd(AC97LinkState *s, AC97BusMasterRegs *r)
 }
 
 /**
- * Update the BM status register
+ * Update the BM status register and drive level-triggered PCI INTx
  */
 static void update_sr(AC97LinkState *s, AC97BusMasterRegs *r, uint32_t new_sr)
 {
-    int event = 0;
-    int level = 0;
-    uint32_t new_mask = new_sr & SR_INT_MASK;
-    uint32_t old_mask = r->sr & SR_INT_MASK;
-    uint32_t masks[] = {GS_PIINT, GS_POINT, GS_MINT};
-
-    if (new_mask ^ old_mask) {
-        /** @todo is IRQ deasserted when only one of status bits is cleared? */
-        if (!new_mask) {
-            event = 1;
-            level = 0;
-        } else {
-            if ((new_mask & SR_LVBCI) && (r->cr & CR_LVBIE)) {
-                event = 1;
-                level = 1;
-            }
-            if ((new_mask & SR_BCIS) && (r->cr & CR_IOCE)) {
-                event = 1;
-                level = 1;
-            }
-        }
-    }
+    static const uint32_t masks[] = {GS_PIINT, GS_POINT, GS_MINT};
+    int bm_index = r - s->bm_regs;
 
     r->sr = new_sr;
 
-    dolog("IOC%d LVB%d sr=0x%x event=%d level=%d",
-          r->sr & SR_BCIS, r->sr & SR_LVBCI, r->sr, event, level);
+    if (bm_index >= 0 && bm_index < 3) {
+        bool channel_active = false;
+        if ((r->sr & SR_BCIS) && (r->cr & CR_IOCE)) {
+            channel_active = true;
+        }
+        if ((r->sr & SR_LVBCI) && (r->cr & CR_LVBIE)) {
+            channel_active = true;
+        }
+        if ((r->sr & SR_FIFOE) && (r->cr & CR_FEIE)) {
+            channel_active = true;
+        }
 
-    if (!event) {
-        return;
+        if (channel_active) {
+            s->glob_sta |= masks[bm_index];
+        } else {
+            s->glob_sta &= ~masks[bm_index];
+        }
     }
 
-    if (level) {
-        s->glob_sta |= masks[r - s->bm_regs];
-        dolog("set irq level=1");
-        pci_irq_assert(s->pci_dev);
-    } else {
-        s->glob_sta &= ~masks[r - s->bm_regs];
-        dolog("set irq level=0");
-        pci_irq_deassert(s->pci_dev);
-    }
+    int global_level = (s->glob_sta & (GS_PIINT | GS_POINT | GS_MINT)) ? 1 : 0;
+    dolog("update_sr: bm=%d sr=0x%x cr=0x%x glob_sta=0x%x global_level=%d",
+          bm_index, r->sr, r->cr, s->glob_sta, global_level);
+    pci_set_irq(s->pci_dev, global_level);
 }
 
 static void voice_set_active(AC97LinkState *s, int bm_index, int on)
@@ -228,7 +218,9 @@ static void voice_set_active(AC97LinkState *s, int bm_index, int on)
         break;
 
     case PO_INDEX:
+#ifndef XBOX
         AUD_set_active_out(s->voice_po, on);
+#endif
         break;
 
     case MC_INDEX:
@@ -315,6 +307,7 @@ static void open_voice(AC97LinkState *s, int index, int freq)
             break;
 
         case PO_INDEX:
+#ifndef XBOX
             s->voice_po = AUD_open_out(
                 s->audio_be,
                 s->voice_po,
@@ -323,6 +316,9 @@ static void open_voice(AC97LinkState *s, int index, int freq)
                 po_callback,
                 &as
                 );
+#else
+            s->voice_po = NULL;
+#endif
             break;
 
         case MC_INDEX:
@@ -352,7 +348,9 @@ static void open_voice(AC97LinkState *s, int index, int freq)
             break;
 
         case PO_INDEX:
+#ifndef XBOX
             AUD_close_out(s->audio_be, s->voice_po);
+#endif
             s->voice_po = NULL;
             break;
 
@@ -379,9 +377,14 @@ static void reset_voices(AC97LinkState *s, uint8_t active[LAST_INDEX])
     AUD_set_active_in(s->voice_pi, active[PI_INDEX]);
 #endif
 
+#ifndef XBOX
     freq = mixer_load(s, AC97_PCM_Front_DAC_Rate);
     open_voice(s, PO_INDEX, freq);
     AUD_set_active_out(s->voice_po, active[PO_INDEX]);
+#else
+    (void)freq;
+    (void)active;
+#endif
 
 #ifndef XBOX
     freq = mixer_load(s, AC97_MIC_ADC_Rate);
@@ -417,7 +420,13 @@ static void update_combined_volume_out(AC97LinkState *s)
     lvol = (lvol * plvol) / 255;
     rvol = (rvol * prvol) / 255;
 
+#ifndef XBOX
     AUD_set_volume_out_lr(s->voice_po, mute, lvol, rvol);
+#else
+    (void)mute;
+    (void)lvol;
+    (void)rvol;
+#endif
 }
 
 static void update_volume_in(AC97LinkState *s)
@@ -808,13 +817,18 @@ static void nabm_writeb(void *opaque, uint32_t addr, uint32_t val)
     case MC_LVI:
     case SO_LVI:
         r = &s->bm_regs[GET_BM(addr)];
-        if ((r->cr & CR_RPBM) && (r->sr & SR_DCH)) {
-            r->sr &= ~(SR_DCH | SR_CELV);
-            r->civ = r->piv;
-            r->piv = (r->piv + 1) % 32;
-            fetch_bd(s, r);
-        }
         r->lvi = val % 32;
+        if ((r->cr & CR_RPBM) && (r->sr & SR_DCH)) {
+            if (r->civ != r->lvi) {
+                r->sr &= ~(SR_DCH | SR_CELV);
+                if (r->picb == 0) {
+                    r->civ = r->piv;
+                    r->piv = (r->piv + 1) % 32;
+                    fetch_bd(s, r);
+                }
+                update_sr(s, r, r->sr);
+            }
+        }
         dolog("LVI[%d] <- 0x%x", GET_BM(addr), val);
         break;
     case PI_CR:
@@ -836,6 +850,7 @@ static void nabm_writeb(void *opaque, uint32_t addr, uint32_t val)
                 r->sr &= ~SR_DCH;
                 voice_set_active(s, r - s->bm_regs, 1);
             }
+            update_sr(s, r, r->sr);
         }
         dolog("CR[%d] <- 0x%x (cr 0x%x)", GET_BM(addr), val, r->cr);
         break;
@@ -844,7 +859,6 @@ static void nabm_writeb(void *opaque, uint32_t addr, uint32_t val)
     case MC_SR:
     case SO_SR:
         r = &s->bm_regs[GET_BM(addr)];
-        r->sr |= val & ~(SR_RO_MASK | SR_WCLEAR_MASK);
         update_sr(s, r, r->sr & ~(val & SR_WCLEAR_MASK));
         dolog("SR[%d] <- 0x%x (sr 0x%x)", GET_BM(addr), val, r->sr);
         break;
@@ -865,7 +879,6 @@ static void nabm_writew(void *opaque, uint32_t addr, uint32_t val)
     case MC_SR:
     case SO_SR:
         r = &s->bm_regs[GET_BM(addr)];
-        r->sr |= val & ~(SR_RO_MASK | SR_WCLEAR_MASK);
         update_sr(s, r, r->sr & ~(val & SR_WCLEAR_MASK));
         dolog("SR[%d] <- 0x%x (sr 0x%x)", GET_BM(addr), val, r->sr);
         break;
@@ -930,7 +943,9 @@ static int write_audio(AC97LinkState *s, AC97BusMasterRegs *r,
         int copied;
         to_copy = MIN(temp, sizeof(tmpbuf));
         dma_memory_read(s->as, addr, tmpbuf, to_copy, MEMTXATTRS_UNSPECIFIED);
-        copied = AUD_write(s->voice_po, tmpbuf, to_copy);
+        /* LLE: Push decoded PCM straight into ACI ring buffer */
+        mcpx_aci_push_pcm(tmpbuf, to_copy);
+        copied = to_copy;
         dolog("write_audio max=%x to_copy=%x copied=%x",
               max, to_copy, copied);
         if (!copied) {
@@ -974,10 +989,14 @@ static void write_bup(AC97LinkState *s, int elapsed)
     while (elapsed) {
         int temp = MIN(elapsed, sizeof(s->silence));
         while (temp) {
+#ifndef XBOX
             int copied = AUD_write(s->voice_po, s->silence, temp);
             if (!copied) {
                 return;
             }
+#else
+            int copied = temp;
+#endif
             temp -= copied;
             elapsed -= copied;
         }
@@ -1057,7 +1076,11 @@ static void transfer_audio(AC97LinkState *s, int index, int elapsed)
             dolog("fresh bd %d is empty 0x%x 0x%x",
                   r->civ, r->bd.addr, r->bd.ctl_len);
             if (r->civ == r->lvi) {
-                r->sr |= SR_DCH; /* CELV? */
+                uint32_t new_sr = r->sr | SR_LVBCI | SR_DCH | SR_CELV;
+                if (r->bd.ctl_len & BD_IOC) {
+                    new_sr |= SR_BCIS;
+                }
+                update_sr(s, r, new_sr);
                 s->bup_flag = 0;
                 break;
             }
@@ -1122,6 +1145,14 @@ static void mc_callback(void *opaque, int avail)
 static void po_callback(void *opaque, int free)
 {
     transfer_audio(opaque, PO_INDEX, free);
+}
+
+void ac97_step_playback(AC97LinkState *s, int bytes)
+{
+    AC97BusMasterRegs *r = &s->bm_regs[PO_INDEX];
+    if ((r->cr & CR_RPBM) && !(r->sr & SR_DCH)) {
+        transfer_audio(s, PO_INDEX, bytes);
+    }
 }
 
 static const VMStateDescription vmstate_ac97_bm_regs = {

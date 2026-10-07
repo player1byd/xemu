@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2018-2019 Jannik Vogel
  * Copyright (c) 2019-2025 Matt Borgerson
+ * Copyright (c) 2026 Will Bonnett
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -175,6 +176,16 @@ static void throttle(MCPXAPUState *d)
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     throttle_update_debug(d, start_us);
     int queued_bytes = -1;
+
+    size_t frame_bytes = d->is_5_1_active ? sizeof(d->monitor.surround_buf)
+                                          : sizeof(d->monitor.frame_buf);
+    if (d->monitor.queued_bytes_low < (int)frame_bytes) {
+        d->monitor.queued_bytes_low = frame_bytes;
+        d->monitor.queued_bytes_high = 3 * frame_bytes;
+    }
+    if (d->monitor.queued_bytes_high <= d->monitor.queued_bytes_low) {
+        d->monitor.queued_bytes_high = 3 * d->monitor.queued_bytes_low;
+    }
 
     if (d->monitor.stream) {
         queued_bytes = SDL_GetAudioStreamQueued(d->monitor.stream);

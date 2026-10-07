@@ -2,6 +2,7 @@
  * DSP56300 emulator
  *
  * Copyright (c) 2015 espes
+ * Copyright (c) 2026 Will Bonnett
  *
  * Adapted from Hatari DSP M56001 emulation
  * (C) 2003-2008 ARAnyM developer team
@@ -44,11 +45,38 @@ typedef struct dsp_interrupt_s {
 } dsp_interrupt_t;
 
 typedef struct dsp_core_s dsp_core_t;
+typedef struct dsp_decoded_op_s dsp_decoded_op_t;
+typedef void (*dsp_exec_fn_t)(dsp_core_t *dsp, const dsp_decoded_op_t *op);
+
+struct dsp_decoded_op_s {
+    dsp_exec_fn_t handler;                 /* 8 bytes: Top-level handler or fused PM engine */
+    void (*alu_handler)(dsp_core_t *dsp);  /* 8 bytes: Direct pointer to opcodes_alu function */
+    uint32_t imm_val;                      /* 4 bytes: Sign-extended 24-bit imm or address */
+    uint8_t  ea_mode;                      /* 1 byte : (cur_inst >> 8) & 0x3F */
+    uint8_t  inst_len;                     /* 1 byte : Instruction word length (1 or 2) */
+    uint8_t  instr_cycle;                  /* 1 byte : Cycle cost */
+    uint8_t  mem_space;                    /* 1 byte : Memory space flag */
+    uint8_t  reg_src1;                     /* 1 byte : Pre-decoded source register index */
+    uint8_t  reg_src2;                     /* 1 byte : Pre-decoded source register 2 */
+    uint8_t  reg_dst1;                     /* 1 byte : Pre-decoded destination register index */
+    uint8_t  reg_dst2;                     /* 1 byte : Pre-decoded destination register 2 */
+    uint8_t  flags;                        /* 1 byte : Status flags */
+    uint8_t  bit_index;                    /* 1 byte : Pre-extracted bit index */
+    uint16_t reserved;                     /* 2 bytes: Explicit padding */
+};
+
+_Static_assert(sizeof(dsp_decoded_op_t) == 32, "dsp_decoded_op_t must be exactly 32 bytes");
+
+#define DSP_OP_FLAG_VALID        (1 << 0)
+#define DSP_OP_FLAG_PARALLEL     (1 << 1)
+#define DSP_OP_FLAG_IMMUTABLE    (1 << 2)
 
 struct dsp_core_s {
     bool is_gp;
     bool is_idle;
     uint32_t cycle_count;
+    uint32_t spin_count;
+    uint32_t last_spin_pc;
 
     /* DSP instruction Cycle counter */
     uint16_t instr_cycle;
@@ -63,7 +91,7 @@ struct dsp_core_s {
     uint32_t xram[DSP_XRAM_SIZE];
     uint32_t yram[DSP_YRAM_SIZE];
     uint32_t pram[DSP_PRAM_SIZE];
-    const void *pram_opcache[DSP_PRAM_SIZE];
+    dsp_decoded_op_t predecode_table[DSP_PRAM_SIZE];
 
     uint32_t mixbuffer[DSP_MIXBUFFER_SIZE];
 
@@ -84,7 +112,7 @@ struct dsp_core_s {
     int16_t interrupt_ipl[4];
     uint16_t interrupt_is_pending[4];
 
-    /* Back-pointer to owning DSPState (set by dsp_c.c) */
+    /* Back-pointer to owning DSPState (set by dsp_emu.c) */
     void *opaque;
 
     /* callbacks */
@@ -141,11 +169,20 @@ struct dsp_core_s {
 /* Functions */
 void dsp56k_reset_cpu(dsp_core_t* dsp);		/* Set dsp_core to use */
 void dsp56k_execute_instruction(dsp_core_t* dsp);	/* Execute 1 instruction */
+const dsp_decoded_op_t *dsp_predecode_word(dsp_core_t* dsp, uint32_t pc);
 
 uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address);
 void dsp56k_write_memory(dsp_core_t* dsp, int space, uint32_t address, uint32_t value);
 
 /* Interrupt relative functions */
 void dsp56k_add_interrupt(dsp_core_t* dsp, uint16_t inter);
+
+/* Stack functions conforming to DSP56300 PCU stack asymmetry */
+void dsp_stack_push_ssh(dsp_core_t* dsp, uint32_t value);
+uint32_t dsp_stack_pop_ssh(dsp_core_t* dsp);
+
+static inline int32_t signextend24(uint32_t val) {
+    return (int32_t)(val << 8) >> 8;
+}
 
 #endif	/* DSP_CPU_H */
