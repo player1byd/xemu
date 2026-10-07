@@ -2,6 +2,7 @@
  * DSP56300 emulator
  *
  * Copyright (c) 2015 espes
+ * Copyright (c) 2026 Will Bonnett
  *
  * Adapted from Hatari DSP M56001 emulation
  * (C) 2003-2008 ARAnyM developer team
@@ -50,6 +51,8 @@
 
 #define DSP_SP_SE   0x04
 #define DSP_SP_UF   0x05
+#define DSP_SP_MASK         0x0F
+#define DSP_SP_ERROR_MASK   ((1 << DSP_SP_SE) | (1 << DSP_SP_UF))
 
 /* Registers numbers in dsp.registers[] */
 #define DSP_REG_X0  0x04
@@ -110,15 +113,40 @@
 #define DSP_SPACE_Y 0x01
 #define DSP_SPACE_P 0x02
 
-#define DSP_XRAM_SIZE 4096
+#define DSP_XRAM_SIZE 65536
 #define DSP_YRAM_SIZE 2048
-#define DSP_PRAM_SIZE 4096
+#define DSP_PRAM_SIZE 32768
 
 #define DSP_MIXBUFFER_BASE 0x001400
 #define DSP_MIXBUFFER_SIZE 1024
 
 #define DSP_PERIPH_BASE 0xFFFF80
 #define DSP_PERIPH_SIZE 128
+
+/* Motorola DSP56362 HDI08 Host Interface peripheral registers ($FFFFC0-$FFFFC9) */
+#define DSP_REG_PERIPH_HCR   0xFFFFC2
+#define DSP_REG_PERIPH_HSR   0xFFFFC3
+#define DSP_REG_PERIPH_HPCR  0xFFFFC4
+#define DSP_REG_PERIPH_HBAR  0xFFFFC5
+#define DSP_REG_PERIPH_HORX  0xFFFFC6
+#define DSP_REG_PERIPH_HOTX  0xFFFFC7
+#define DSP_REG_PERIPH_HDDR  0xFFFFC8
+#define DSP_REG_PERIPH_HDR   0xFFFFC9
+
+/* HSR (Host Status Register at $FFFFC3) bitfields */
+#define DSP_HSR_HRDF         (1 << 0)
+#define DSP_HSR_HTDE         (1 << 1)
+#define DSP_HSR_HCP          (1 << 2)
+#define DSP_HSR_HF0          (1 << 3)
+#define DSP_HSR_HF1          (1 << 4)
+#define DSP_HSR_DMA          (1 << 7)
+
+/* HCR (Host Control Register at $FFFFC2) bitfields */
+#define DSP_HCR_HRIE         (1 << 0)
+#define DSP_HCR_HTIE         (1 << 1)
+#define DSP_HCR_HCIE         (1 << 2)
+#define DSP_HCR_HF2          (1 << 3)
+#define DSP_HCR_HF3          (1 << 4)
 
 #define DSP_INTERRUPT_NONE      0x0
 #define DSP_INTERRUPT_DISABLED  0x1

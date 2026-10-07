@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2018-2019 Jannik Vogel
  * Copyright (c) 2019-2025 Matt Borgerson
+ * Copyright (c) 2026 Will Bonnett
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -21,12 +22,34 @@
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
 
+#define EP_SUBFRAME_CYCLES 12800
+
 static const int16_t ep_silence[256][2] = { 0 };
+
+static inline float clampf(float v, float min_val, float max_val)
+{
+    if (v < min_val) {
+        return min_val;
+    }
+    if (v > max_val) {
+        return max_val;
+    }
+    return v;
+}
+
+static inline int16_t float_to_s16(float v)
+{
+    if (v >= 1.0f) {
+        return 32767;
+    } else if (v <= -1.0f) {
+        return -32768;
+    }
+    return (int16_t)lrintf(v * 32767.0f);
+}
 
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     static int last_known_dsp_pref = -1;
-    static int last_known_jit_pref = -1;
 
     if (last_known_dsp_pref != (int)g_config.audio.use_dsp) {
         if (g_config.audio.use_dsp) {
@@ -39,12 +62,6 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
             d->ep.realtime = false;
         }
         last_known_dsp_pref = g_config.audio.use_dsp;
-    }
-
-    if (last_known_jit_pref != (int)g_config.audio.use_dsp_jit) {
-        dsp_set_engine(d->gp.dsp, g_config.audio.use_dsp_jit);
-        dsp_set_engine(d->ep.dsp, g_config.audio.use_dsp_jit);
-        last_known_jit_pref = g_config.audio.use_dsp_jit;
     }
 }
 
@@ -112,6 +129,14 @@ static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
                                            uint32_t base, uint32_t end,
                                            uint32_t cur, size_t len, bool dir)
 {
+    if (sge_base == 0) {
+        cur += len;
+        if (cur >= end) {
+            cur = base + ((cur - base) % (end - base));
+        }
+        return cur;
+    }
+
     while (len > 0) {
         unsigned int bytes_to_copy = end - cur;
 
@@ -189,7 +214,9 @@ static bool ep_sink_samples(MCPXAPUState *d, uint8_t *ptr, size_t len)
     } else if ((d->monitor.point == MCPX_APU_DEBUG_MON_EP) ||
         (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP)) {
         assert(len == sizeof(d->monitor.frame_buf));
-        memcpy(d->monitor.frame_buf, ptr, len);
+        if (d->is_5_1_active) {
+            memcpy(d->monitor.frame_buf, ptr, len);
+        }
     }
 
     return true;
@@ -204,21 +231,29 @@ static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
     hwaddr cur_reg;
     if (dir) {
         assert(index < EP_OUTPUT_FIFO_COUNT);
-        base = GET_MASK(d->regs[NV_PAPU_EPOFBASE0 + 0x10 * index],
+        base = GET_MASK(d->regs[NV_PAPU_EPOFBASE0 + 0x10 * index] |
+                        d->ep.regs[NV_PAPU_EPOFBASE0 + 0x10 * index],
                         NV_PAPU_GPOFBASE0_VALUE);
-        end = GET_MASK(d->regs[NV_PAPU_EPOFEND0 + 0x10 * index],
+        end = GET_MASK(d->regs[NV_PAPU_EPOFEND0 + 0x10 * index] |
+                       d->ep.regs[NV_PAPU_EPOFEND0 + 0x10 * index],
                        NV_PAPU_GPOFEND0_VALUE);
         cur_reg = NV_PAPU_EPOFCUR0 + 0x10 * index;
     } else {
         assert(index < EP_INPUT_FIFO_COUNT);
-        base = GET_MASK(d->regs[NV_PAPU_EPIFBASE0 + 0x10 * index],
+        base = GET_MASK(d->regs[NV_PAPU_EPIFBASE0 + 0x10 * index] |
+                        d->ep.regs[NV_PAPU_EPIFBASE0 + 0x10 * index],
                         NV_PAPU_GPOFBASE0_VALUE);
-        end = GET_MASK(d->regs[NV_PAPU_EPIFEND0 + 0x10 * index],
+        end = GET_MASK(d->regs[NV_PAPU_EPIFEND0 + 0x10 * index] |
+                       d->ep.regs[NV_PAPU_EPIFEND0 + 0x10 * index],
                        NV_PAPU_GPOFEND0_VALUE);
         cur_reg = NV_PAPU_EPIFCUR0 + 0x10 * index;
     }
 
-    uint32_t cur = GET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE);
+    if (end <= base) {
+        return;
+    }
+
+    uint32_t cur = GET_MASK(d->regs[cur_reg] | d->ep.regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE);
 
     // fprintf(stderr, "EP %s fifo #%d, base = %x, end = %x, cur = %x, len = %x\n",
     //     dir ? "writing to" : "reading from", index,
@@ -233,19 +268,23 @@ static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
         }
     }
 
-    /* DSP hangs if current >= end; but forces current >= base */
+    /* Circular modulo boundary wrapping relative to base */
     if (cur >= end) {
-        cur = cur % (end - base);
+        cur = base + ((cur - base) % (end - base));
     }
     if (cur < base) {
         cur = base;
     }
 
+    hwaddr sge_base = d->regs[NV_PAPU_EPFADDR] | d->ep.regs[NV_PAPU_EPFADDR];
+    unsigned int max_sge = d->regs[NV_PAPU_EPFMAXSGE] | d->ep.regs[NV_PAPU_EPFMAXSGE];
+
     cur = circular_scatter_gather_rw(d,
-        d->regs[NV_PAPU_EPFADDR], d->regs[NV_PAPU_EPFMAXSGE],
+        sge_base, max_sge,
         ptr, base, end, cur, len, dir);
 
     SET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE, cur);
+    SET_MASK(d->ep.regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE, cur);
 }
 
 static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
@@ -460,34 +499,109 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         dsp_start_frame(d->gp.dsp);
         dsp_set_halt_requested(d->gp.dsp, false);
         dsp_set_cycle_count(d->gp.dsp, 0);
-        do {
+        while (!dsp_get_halt_requested(d->gp.dsp) && d->gp.realtime) {
             dsp_run(d->gp.dsp, 1000);
-        } while (!dsp_get_halt_requested(d->gp.dsp) && d->gp.realtime);
+        }
         g_dbg.gp.cycles = dsp_get_cycle_count(d->gp.dsp);
 
-        if ((d->monitor.point == MCPX_APU_DEBUG_MON_GP) ||
-            (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP && !ep_enabled)) {
+        if (!d->is_5_1_active) {
             int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 uint32_t l = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + i);
-                d->monitor.frame_buf[off + i][0] = l >> 8;
-                uint32_t r =
-                    dsp_read_memory(d->gp.dsp, 'X', 0x1400 + 1 * 0x20 + i);
-                d->monitor.frame_buf[off + i][1] = r >> 8;
+                uint32_t r = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + 0x20 + i);
+                float gp_left = int24_to_float(l);
+                float gp_right = int24_to_float(r);
+                d->monitor.frame_buf[off + i][0] = float_to_s16(clampf(gp_left, -1.0f, 1.0f));
+                d->monitor.frame_buf[off + i][1] = float_to_s16(clampf(gp_right, -1.0f, 1.0f));
+            }
+        }
+    }
+
+    /* Forward multichannel PCM blocks to EP aperture (X:0x4000) using 512-word (0x0200) strides per pair */
+    if (d->is_5_1_active && ep_enabled) {
+        int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            int sample_idx = (off + i) * 2;
+            /* Pair 0 (FL / FR): offset 0x0000 */
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 0 * 0x0200 + sample_idx,
+                             float_to_24b(mixbins[0][i]));
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 0 * 0x0200 + sample_idx + 1,
+                             float_to_24b(mixbins[1][i]));
+            /* Pair 1 (FC / LFE): offset 0x0200 */
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 1 * 0x0200 + sample_idx,
+                             float_to_24b(mixbins[2][i]));
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 1 * 0x0200 + sample_idx + 1,
+                             float_to_24b(mixbins[3][i]));
+            /* Pair 2 (RL / RR): offset 0x0400 */
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 2 * 0x0200 + sample_idx,
+                             float_to_24b(mixbins[4][i]));
+            dsp_write_memory(d->ep.dsp, 'X', 0x4000 + 2 * 0x0200 + sample_idx + 1,
+                             float_to_24b(mixbins[5][i]));
+        }
+    }
+
+    /* Surround monitor buffer routing */
+    if (d->is_5_1_active) {
+        int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+
+        if (ep_enabled) {
+            /* Full 6-channel discrete surround with additive GP 2D stereo bus mixing into FL/FR */
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                uint32_t l = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + i);
+                uint32_t r = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + 0x20 + i);
+                float gp_left = int24_to_float(l);
+                float gp_right = int24_to_float(r);
+                float fl = mixbins[0][i] + gp_left;
+                float fr = mixbins[1][i] + gp_right;
+
+                d->monitor.surround_buf[off + i][0] = float_to_s16(clampf(fl, -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][1] = float_to_s16(clampf(fr, -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][2] = float_to_s16(clampf(mixbins[2][i], -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][3] = float_to_s16(clampf(mixbins[3][i], -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][4] = float_to_s16(clampf(mixbins[4][i], -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][5] = float_to_s16(clampf(mixbins[5][i], -1.0f, 1.0f));
+            }
+        } else {
+            /* Bootloader intro (!ep_enabled): mirror GP mixbuffer to FL/FR and zero surround channels */
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                uint32_t l = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + i);
+                uint32_t r = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + 0x20 + i);
+                float gp_left = int24_to_float(l);
+                float gp_right = int24_to_float(r);
+                d->monitor.surround_buf[off + i][0] = float_to_s16(clampf(gp_left, -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][1] = float_to_s16(clampf(gp_right, -1.0f, 1.0f));
+                d->monitor.surround_buf[off + i][2] = 0;
+                d->monitor.surround_buf[off + i][3] = 0;
+                d->monitor.surround_buf[off + i][4] = 0;
+                d->monitor.surround_buf[off + i][5] = 0;
             }
         }
     }
 
     /* Run EP */
-    if ((d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
-        (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST)) {
-        if (d->ep_frame_div % 8 == 0) {
+    if (ep_enabled) {
+        uint32_t reset_vec =
+            dsp_read_memory(d->ep.dsp, 'P', 0x0000) & 0x00ffffff;
+        if (reset_vec != 0 && reset_vec != 0x00cacaca) {
+            static bool detected = false;
+            if (!detected) {
+                fprintf(stderr,
+                        "[EP LITMUS] Guest DMA Detected! Reset vector P:0x0000 = 0x%06X (PC: 0x%06X)\n",
+                        reset_vec, dsp_get_pc(d->ep.dsp));
+                detected = true;
+            }
+
             dsp_start_frame(d->ep.dsp);
-            dsp_set_halt_requested(d->ep.dsp, false);
+            d->ep.dsp->hsr |= DSP_HSR_HRDF;
+            int cycle_budget = EP_SUBFRAME_CYCLES;
             dsp_set_cycle_count(d->ep.dsp, 0);
-            do {
-                dsp_run(d->ep.dsp, 1000);
-            } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime);
+            dsp_set_halt_requested(d->ep.dsp, false);
+
+            while (cycle_budget > 0 && !dsp_get_halt_requested(d->ep.dsp)) {
+                int step_chunk = (cycle_budget > 1000) ? 1000 : cycle_budget;
+                dsp_run(d->ep.dsp, step_chunk);
+                cycle_budget -= step_chunk;
+            }
             g_dbg.ep.cycles = dsp_get_cycle_count(d->ep.dsp);
         }
     }
@@ -502,6 +616,7 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     d->ep.dsp = dsp_init(d, ep_scratch_rw, ep_fifo_rw, false);
     dsp_set_halt_requested(d->ep.dsp, false);
     dsp_set_cycle_count(d->ep.dsp, 0);
+    dsp_bootstrap(d->ep.dsp);
 
     /* Until DSP is more performant, a switch to decide whether or not we should
      * use the full audio pipeline or not.

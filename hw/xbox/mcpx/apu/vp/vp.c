@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2018-2019 Jannik Vogel
  * Copyright (c) 2019-2025 Matt Borgerson
+ * Copyright (c) 2026 Will Bonnett
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -930,7 +931,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
 
         DPRINTF("**** STREAMING (%d) ****\n", v);
-        assert(!loop);
 
         ssl_index = d->vp.ssl[v].ssl_index;
         ssl_seg = d->vp.ssl[v].ssl_seg;
@@ -957,22 +957,23 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(&address_space_memory, addr);
         segment_length = ldl_le_phys(&address_space_memory, addr + 4);
-        assert(segment_offset != 0);
-        assert(segment_length != 0);
+
+        if (segment_offset == 0 || segment_length == 0) {
+            DPRINTF("VP: Null or uninitialized descriptor encountered for voice\n");
+            memset(samples, 0, num_samples_requested * sizeof(float) * 2);
+            return -1;
+        }
+
         seg_len = (segment_length >> 0) & 0xffff;
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
         seg_s = (segment_length >> 23) & 1;
-        assert(seg_cs == container_size_index);
-        assert((seg_spb + 1) == samples_per_block);
-        assert(seg_s == stereo);
         container_size_index = seg_cs;
         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
         }
 
-        assert(seg_len > 0);
-        ebo = seg_len - 1; // FIXME: Confirm seg_len-1 is last valid sample index
+        ebo = (seg_len > 0) ? (seg_len - 1) : 0; // FIXME: Confirm seg_len-1 is last valid sample index
 
         DPRINTF("Segment: SSL%c[%d]\n", 'A' + ssl_index, ssl_seg);
         DPRINTF("Page: %x\n", page);
@@ -1019,9 +1020,15 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
                     int max_seg_byte = (seg_len >> 6) * block_size;
-                    assert(linear_addr + block_size <= max_seg_byte);
-                    memcpy(adpcm_block, &d->ram_ptr[addr],
-                           block_size); // FIXME: Use idiomatic DMA function
+                    uint64_t ram_size = memory_region_size(d->ram);
+                    if (segment_offset != 0 &&
+                        (linear_addr + block_size) <= (uint32_t)max_seg_byte &&
+                        (addr + block_size) <= ram_size) {
+                        memcpy(adpcm_block, &d->ram_ptr[addr],
+                               block_size); // FIXME: Use idiomatic DMA function
+                    } else {
+                        memset(adpcm_block, 0, block_size);
+                    }
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
@@ -1056,29 +1063,35 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                     linear_addr);
             }
 
+            uint64_t ram_size = memory_region_size(d->ram);
+            bool valid_stream_addr = (!stream ||
+                (segment_offset != 0 && (addr + (hwaddr)container_size * channels) <= ram_size));
+
             for (unsigned int channel = 0; channel < channels; channel++) {
                 uint32_t ival;
-                float fval;
-                switch (sample_size) {
-                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(&address_space_memory, addr);
-                    fval = uint8_to_float(ival & 0xff);
-                    break;
-                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(&address_space_memory, addr);
-                    fval = int16_to_float(ival & 0xffff);
-                    break;
-                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(&address_space_memory, addr);
-                    fval = int24_to_float(ival);
-                    break;
-                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(&address_space_memory, addr);
-                    fval = int32_to_float(ival);
-                    break;
-                default:
-                    assert(!"Invalid sample size for NV_PAYS_VOICE_CFG_FMT");
-                    break;
+                float fval = 0.0f;
+                if (valid_stream_addr) {
+                    switch (sample_size) {
+                    case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
+                        ival = ldub_phys(&address_space_memory, addr);
+                        fval = uint8_to_float(ival & 0xff);
+                        break;
+                    case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
+                        ival = lduw_le_phys(&address_space_memory, addr);
+                        fval = int16_to_float(ival & 0xffff);
+                        break;
+                    case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
+                        ival = ldl_le_phys(&address_space_memory, addr);
+                        fval = int24_to_float(ival);
+                        break;
+                    case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
+                        ival = ldl_le_phys(&address_space_memory, addr);
+                        fval = int32_to_float(ival);
+                        break;
+                    default:
+                        assert(!"Invalid sample size for NV_PAYS_VOICE_CFG_FMT");
+                        break;
+                    }
                 }
                 samples[sample_count][channel] = fval;
                 addr += container_size;
@@ -1377,7 +1390,15 @@ static void voice_process(MCPXAPUState *d,
     bin[7] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                             NV_PAVS_VOICE_CFG_FMT_V7BIN);
 
+    uint16_t hrtf_handle = HRTF_NULL_HANDLE;
     if (v < MCPX_HW_MAX_3D_VOICES) {
+        hrtf_handle = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                     NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+    }
+    bool use_hrtf = (v < MCPX_HW_MAX_3D_VOICES) && !stereo &&
+                    (hrtf_handle != HRTF_NULL_HANDLE) && g_config.audio.hrtf;
+
+    if (use_hrtf) {
         bin[0] = d->vp.hrtf_submix[0];
         bin[1] = d->vp.hrtf_submix[1];
         bin[2] = d->vp.hrtf_submix[2];
@@ -1455,13 +1476,8 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
-        uint16_t hrtf_handle =
-            voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
-                           NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
-        if (hrtf_handle != HRTF_NULL_HANDLE) {
-            hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
-        }
+    if (use_hrtf) {
+        hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
     }
 
     // FIXME: ParaEQ
@@ -1469,7 +1485,7 @@ static void voice_process(MCPXAPUState *d,
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
-        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+        if (use_hrtf && (b < 4)) {
             // FIXME: Not sure if submix/voice headroom factor in for HRTF
             hr = 1 << d->vp.hrtf_headroom;
         } else {
@@ -1542,8 +1558,18 @@ static void get_voice_bin_src_dst(MCPXAPUState *d, int v,
         }
     }
 
-    int bin[8];
+    bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                 NV_PAVS_VOICE_CFG_FMT_STEREO);
+    uint16_t hrtf_handle = HRTF_NULL_HANDLE;
     if (v < MCPX_HW_MAX_3D_VOICES) {
+        hrtf_handle = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                     NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+    }
+    bool use_hrtf = (v < MCPX_HW_MAX_3D_VOICES) && !stereo &&
+                    (hrtf_handle != HRTF_NULL_HANDLE) && g_config.audio.hrtf;
+
+    int bin[8];
+    if (use_hrtf) {
         bin[0] = d->vp.hrtf_submix[0];
         bin[1] = d->vp.hrtf_submix[1];
         bin[2] = d->vp.hrtf_submix[2];
@@ -1872,7 +1898,10 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
-    memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
+    d->vp.hrtf_submix[0] = 0;
+    d->vp.hrtf_submix[1] = 1;
+    d->vp.hrtf_submix[2] = 2;
+    d->vp.hrtf_submix[3] = 3;
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < ARRAY_SIZE(d->vp.filters); v++) {

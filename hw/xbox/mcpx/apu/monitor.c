@@ -2,6 +2,7 @@
  * QEMU MCPX Audio Processing Unit implementation
  *
  * Copyright (c) 2019-2025 Matt Borgerson
+ * Copyright (c) 2026 Will Bonnett
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,13 +19,83 @@
  */
 
 #include "apu_int.h"
+#include "hw/xbox/mcpx/aci.h"
+
+static inline int16_t clamp16(int32_t val)
+{
+    if (val > 32767) {
+        return 32767;
+    }
+    if (val < -32768) {
+        return -32768;
+    }
+    return (int16_t)val;
+}
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
+    bool eeprom_wants_surround = false;
+    uint32_t audio_flags = 0;
+    const char *eeprom_path = g_config.sys.files.eeprom_path;
+    if (!eeprom_path || !eeprom_path[0]) {
+        eeprom_path = xemu_settings_get_default_eeprom_path();
+    }
+    if (eeprom_path) {
+        FILE *fp = fopen(eeprom_path, "rb");
+        if (fp) {
+            uint32_t user_block[4] = {0};
+            if (fseek(fp, 0x90, SEEK_SET) == 0 &&
+                fread(user_block, sizeof(uint32_t), 4, fp) == 4) {
+                user_block[0] = le32_to_cpu(user_block[0]);
+                user_block[1] = le32_to_cpu(user_block[1]);
+                user_block[2] = le32_to_cpu(user_block[2]);
+                user_block[3] = le32_to_cpu(user_block[3]);
+
+                fprintf(stderr,
+                        "[APU MONITOR] EEPROM Config Block: [0x90]=0x%08X [0x94]=0x%08X [0x98]=0x%08X [0x9C]=0x%08X\n",
+                        user_block[0], user_block[1], user_block[2], user_block[3]);
+
+                audio_flags = user_block[2];
+                if ((audio_flags & 0x00010000) || (audio_flags & 0x00000002)) {
+                    eeprom_wants_surround = true;
+                } else if ((user_block[3] & 0x00010000) || (user_block[3] & 0x00000002)) {
+                    audio_flags = user_block[3];
+                    eeprom_wants_surround = true;
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+    const char *env_surround = getenv("XEMU_SURROUND");
+    bool env_wants_surround = env_surround &&
+                              strcmp(env_surround, "0") != 0 &&
+                              strcasecmp(env_surround, "false") != 0;
+    bool surround_requested = eeprom_wants_surround || env_wants_surround;
+
+    fprintf(stderr,
+            "[APU MONITOR] EEPROM audio flags: 0x%08X (Surround requested: %s)\n",
+            audio_flags, surround_requested ? "yes" : "no");
+
+    /* Firmware-gated surround activation: verify EP P-RAM is populated */
+    uint32_t reset_vec = dsp_read_memory(d->ep.dsp, 'P', 0x0000) & 0x00FFFFFF;
+    if (reset_vec == 0 || reset_vec == 0x00CACACA) {
+        dsp_bootstrap_ep_firmware(d->ep.dsp);
+        reset_vec = dsp_read_memory(d->ep.dsp, 'P', 0x0000) & 0x00FFFFFF;
+    }
+
+    bool fw_present = (reset_vec != 0 && reset_vec != 0x00CACACA);
+    d->is_5_1_active = (surround_requested && fw_present);
+
+    fprintf(stderr, "[APU MONITOR] Audio mode: %s (%d channels)%s\n",
+            d->is_5_1_active ? "5.1 Surround" : "Stereo",
+            d->is_5_1_active ? 6 : 2,
+            (!fw_present && surround_requested) ? " [Fallback: EP firmware missing]" : "");
+
     SDL_AudioSpec spec = {
         .freq = 48000,
         .format = SDL_AUDIO_S16LE,
-        .channels = 2,
+        .channels = d->is_5_1_active ? 6 : 2,
     };
 
     d->monitor.stream = NULL;
@@ -52,7 +123,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
                           SDL_AUDIO_BYTESIZE(spec.format) *
                           spec.freq / dev_spec.freq;
     }
-    int frame_bytes = sizeof(d->monitor.frame_buf);
+    int frame_bytes = d->is_5_1_active ? sizeof(d->monitor.surround_buf)
+                                       : sizeof(d->monitor.frame_buf);
     int drain = MAX(dev_drain_bytes, frame_bytes);
     d->monitor.queued_bytes_low = drain;
     d->monitor.queued_bytes_high = 3 * drain;
@@ -73,12 +145,38 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
+    int16_t aci_pcm[256 * 2];
+    size_t aci_samples = mcpx_aci_read_pcm(aci_pcm, 256);
+    if (aci_samples > 0) {
+        if (d->is_5_1_active) {
+            for (size_t i = 0; i < aci_samples; i++) {
+                int32_t fl = d->monitor.surround_buf[i][0] + aci_pcm[i * 2];
+                int32_t fr = d->monitor.surround_buf[i][1] + aci_pcm[i * 2 + 1];
+                d->monitor.surround_buf[i][0] = clamp16(fl);
+                d->monitor.surround_buf[i][1] = clamp16(fr);
+            }
+        } else {
+            for (size_t i = 0; i < aci_samples; i++) {
+                int32_t l = d->monitor.frame_buf[i][0] + aci_pcm[i * 2];
+                int32_t r = d->monitor.frame_buf[i][1] + aci_pcm[i * 2 + 1];
+                d->monitor.frame_buf[i][0] = clamp16(l);
+                d->monitor.frame_buf[i][1] = clamp16(r);
+            }
+        }
+    }
+
     if (d->monitor.stream) {
         float vu = pow(fmax(0.0, fmin(g_config.audio.volume_limit, 1.0)), M_E);
         SDL_SetAudioStreamGain(d->monitor.stream, vu);
-        SDL_PutAudioStreamData(d->monitor.stream, d->monitor.frame_buf,
-                            sizeof(d->monitor.frame_buf));
+        if (d->is_5_1_active) {
+            SDL_PutAudioStreamData(d->monitor.stream, d->monitor.surround_buf,
+                                   sizeof(d->monitor.surround_buf));
+        } else {
+            SDL_PutAudioStreamData(d->monitor.stream, d->monitor.frame_buf,
+                                   sizeof(d->monitor.frame_buf));
+        }
     }
 
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    memset(d->monitor.surround_buf, 0, sizeof(d->monitor.surround_buf));
 }

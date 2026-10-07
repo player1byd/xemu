@@ -2,6 +2,7 @@
  * DSP56300 instruction routines
  *
  * Copyright (c) 2015 espes
+ * Copyright (c) 2026 Will Bonnett
  *
  * Adapted from Hatari DSP M56001 emulation
  * (C) 2003-2008 ARAnyM developer team
@@ -48,17 +49,23 @@ static void emu_update_rn_bitreverse(dsp_core_t* dsp, uint32_t numreg)
     uint32_t value, r_reg;
 
     /* Check how many bits to reverse */
-    value = dsp->registers[DSP_REG_N0+numreg];
-    for (revbits=0;revbits<16;revbits++) {
+    value = dsp->registers[DSP_REG_N0+numreg] & BITMASK(24);
+    if (value == 0) {
+        return;
+    }
+    for (revbits=0;revbits<24;revbits++) {
         if (value & (1<<revbits)) {
             break;
         }
     }
     revbits++;
+    if (revbits > 24) {
+        revbits = 24;
+    }
 
     /* Reverse Rn bits */
-    r_reg = dsp->registers[DSP_REG_R0+numreg];
-    value = r_reg & (BITMASK(16)-BITMASK(revbits));
+    r_reg = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+    value = r_reg & (BITMASK(24)-BITMASK(revbits));
     for (i=0;i<revbits;i++) {
         if (r_reg & (1<<i)) {
             value |= 1<<(revbits-i-1);
@@ -70,80 +77,87 @@ static void emu_update_rn_bitreverse(dsp_core_t* dsp, uint32_t numreg)
     value &= BITMASK(revbits);
 
     /* Reverse Rn bits */
-    r_reg &= (BITMASK(16)-BITMASK(revbits));
+    r_reg &= (BITMASK(24)-BITMASK(revbits));
     r_reg |= value;
 
-    value = r_reg & (BITMASK(16)-BITMASK(revbits));
+    value = r_reg & (BITMASK(24)-BITMASK(revbits));
     for (i=0;i<revbits;i++) {
         if (r_reg & (1<<i)) {
             value |= 1<<(revbits-i-1);
         }
     }
 
-    dsp->registers[DSP_REG_R0+numreg] = value;
+    dsp->registers[DSP_REG_R0+numreg] = value & BITMASK(24);
 }
 
-static void emu_update_rn_modulo(dsp_core_t* dsp, uint32_t numreg, int16_t modifier)
+static void emu_update_rn_modulo(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
 {
-    uint16_t bufsize, modulo, lobound, hibound, bufmask;
-    int16_t r_reg, orig_modifier=modifier;
+    uint32_t m_low = dsp->registers[DSP_REG_M0+numreg] & 0xFFFF;
+    uint32_t modulo = (m_low & 0x7FFF) + 1;
+    uint32_t bufsize = 1;
 
-    modulo = dsp->registers[DSP_REG_M0+numreg]+1;
-    bufsize = 1;
-    bufmask = BITMASK(16);
     while (bufsize < modulo) {
         bufsize <<= 1;
-        bufmask <<= 1;
     }
 
-    lobound = dsp->registers[DSP_REG_R0+numreg] & bufmask;
-    hibound = lobound + modulo - 1;
+    uint32_t bufmask = BITMASK(24) & ~(bufsize - 1);
+    uint32_t r_reg = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+    uint32_t lobound = r_reg & bufmask;
+    uint32_t hibound = lobound + modulo - 1;
 
-    r_reg = (int16_t) dsp->registers[DSP_REG_R0+numreg];
+    int64_t next_r = (int64_t)r_reg + modifier;
 
-    if (orig_modifier>modulo) {
-        while (modifier>bufsize) {
-            r_reg += bufsize;
-            modifier -= bufsize;
-        }
-        while (modifier<-bufsize) {
-            r_reg -= bufsize;
-            modifier += bufsize;
-        }
+    if (next_r > hibound) {
+        r_reg = lobound + ((uint32_t)(next_r - lobound) % modulo);
+    } else if (next_r < lobound) {
+        int64_t dist = (int64_t)hibound - next_r;
+        r_reg = hibound - ((uint32_t)dist % modulo);
+    } else {
+        r_reg = (uint32_t)next_r;
     }
 
-    r_reg += modifier;
-
-    if (orig_modifier!=modulo) {
-        if (r_reg>hibound) {
-            r_reg -= modulo;
-        } else if (r_reg<lobound) {
-            r_reg += modulo;
-        }
-    }
-
-    dsp->registers[DSP_REG_R0+numreg] = ((uint32_t) r_reg) & BITMASK(16);
+    dsp->registers[DSP_REG_R0+numreg] = r_reg & BITMASK(24);
 }
 
-static void emu_update_rn(dsp_core_t* dsp, uint32_t numreg, int16_t modifier)
+static void emu_update_rn_multiple_wrap(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
 {
-    int16_t value;
-    uint16_t m_reg;
+    uint32_t m_low = dsp->registers[DSP_REG_M0+numreg] & 0xFFFF;
+    uint32_t modulo = (m_low & 0x3FFF) + 1;
+    uint32_t mask = modulo - 1;
+    uint32_t r_reg = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+    uint32_t base = r_reg & ~mask;
+    uint32_t offset = ((r_reg & mask) + (uint32_t)modifier) & mask;
 
-    m_reg = (uint16_t) dsp->registers[DSP_REG_M0+numreg];
-    if (m_reg == 65535) {
+    dsp->registers[DSP_REG_R0+numreg] = (base | offset) & BITMASK(24);
+}
+
+static void emu_update_rn(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
+{
+    if (__builtin_expect((dsp->registers[DSP_REG_M0 + numreg] & 0x00FFFFFF) == 0x00FFFFFF, 1)) {
+        dsp->registers[DSP_REG_R0 + numreg] = 
+            (dsp->registers[DSP_REG_R0 + numreg] + (uint32_t)modifier) & BITMASK(24);
+        return;
+    }
+
+    uint32_t m_low = dsp->registers[DSP_REG_M0+numreg] & 0xFFFF;
+
+    if (m_low == 0xFFFF) {
         /* Linear addressing mode */
-        value = (int16_t) dsp->registers[DSP_REG_R0+numreg];
-        value += modifier;
-        dsp->registers[DSP_REG_R0+numreg] = ((uint32_t) value) & BITMASK(16);
-    } else if (m_reg == 0) {
+        uint32_t r_reg = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+        dsp->registers[DSP_REG_R0+numreg] = (r_reg + (uint32_t)modifier) & BITMASK(24);
+    } else if (m_low == 0x0000) {
         /* Bit reversed carry update */
         emu_update_rn_bitreverse(dsp, numreg);
-    } else if (m_reg<=32767) {
+    } else if ((m_low & 0xC000) == 0x8000 && (m_low & 0x3FFF) != 0) {
+        /* Multiple wrap-around modulo addressing mode */
+        emu_update_rn_multiple_wrap(dsp, numreg, modifier);
+    } else if (m_low > 0 && m_low <= 0x7FFF) {
         /* Modulo update */
         emu_update_rn_modulo(dsp, numreg, modifier);
     } else {
-        /* Undefined */
+        /* Reserved / undefined - default to linear addressing */
+        uint32_t r_reg = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+        dsp->registers[DSP_REG_R0+numreg] = (r_reg + (uint32_t)modifier) & BITMASK(24);
     }
 }
 
@@ -156,40 +170,50 @@ static int emu_calc_ea(dsp_core_t* dsp, uint32_t ea_mode, uint32_t *dst_addr)
     switch (value) {
         case 0:
             /* (Rx)-Nx */
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
-            emu_update_rn(dsp, numreg, -dsp->registers[DSP_REG_N0+numreg]);
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+            emu_update_rn(dsp, numreg, -(int32_t)dsp_signextend(24, dsp->registers[DSP_REG_N0+numreg]));
             break;
         case 1:
             /* (Rx)+Nx */
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
-            emu_update_rn(dsp, numreg, dsp->registers[DSP_REG_N0+numreg]);
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+            emu_update_rn(dsp, numreg, (int32_t)dsp_signextend(24, dsp->registers[DSP_REG_N0+numreg]));
             break;
         case 2:
             /* (Rx)- */
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
-            emu_update_rn(dsp, numreg, -1);
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+            if (__builtin_expect((dsp->registers[DSP_REG_M0 + numreg] & 0x00FFFFFF) == 0x00FFFFFF, 1)) {
+                dsp->registers[DSP_REG_R0 + numreg] = 
+                    (dsp->registers[DSP_REG_R0 + numreg] - 1) & BITMASK(24);
+            } else {
+                emu_update_rn(dsp, numreg, -1);
+            }
             break;
         case 3:
             /* (Rx)+ */
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
-            emu_update_rn(dsp, numreg, +1);
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
+            if (__builtin_expect((dsp->registers[DSP_REG_M0 + numreg] & 0x00FFFFFF) == 0x00FFFFFF, 1)) {
+                dsp->registers[DSP_REG_R0 + numreg] = 
+                    (dsp->registers[DSP_REG_R0 + numreg] + 1) & BITMASK(24);
+            } else {
+                emu_update_rn(dsp, numreg, +1);
+            }
             break;
         case 4:
             /* (Rx) */
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
             break;
         case 5:
             /* (Rx+Nx) */
             dsp->instr_cycle += 2;
             curreg = dsp->registers[DSP_REG_R0+numreg];
-            emu_update_rn(dsp, numreg, dsp->registers[DSP_REG_N0+numreg]);
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
+            emu_update_rn(dsp, numreg, (int32_t)dsp_signextend(24, dsp->registers[DSP_REG_N0+numreg]));
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
             dsp->registers[DSP_REG_R0+numreg] = curreg;
             break;
         case 6:
             /* aa */
             dsp->instr_cycle += 2;
-            *dst_addr = read_memory_p(dsp, dsp->pc+1);
+            *dst_addr = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
             dsp->cur_inst_len++;
             if (numreg != 0) {
                 return 1; /* immediate value */
@@ -199,7 +223,7 @@ static int emu_calc_ea(dsp_core_t* dsp, uint32_t ea_mode, uint32_t *dst_addr)
             /* -(Rx) */
             dsp->instr_cycle += 2;
             emu_update_rn(dsp, numreg, -1);
-            *dst_addr = dsp->registers[DSP_REG_R0+numreg];
+            *dst_addr = dsp->registers[DSP_REG_R0+numreg] & BITMASK(24);
             break;
     }
     /* address */
@@ -5149,7 +5173,6 @@ static void emu_pm_8(dsp_core_t* dsp);
 static int emu_pm_read_accu24(dsp_core_t* dsp, int numreg, uint32_t *dest)
 {
     uint32_t scaling, value, reg;
-    int got_limited = 0;
 
     /* Read an accumulator, stores it limited */
 
@@ -5180,35 +5203,16 @@ static int emu_pm_read_accu24(dsp_core_t* dsp, int numreg, uint32_t *dest)
     /* limiting ? */
     value &= BITMASK(24);
 
-    if (dsp->registers[DSP_REG_A2+reg] == 0) {
-        if (value <= 0x007fffff) {
-            /* No limiting */
-            *dest=value;
-            return 0;
-        }
+    uint32_t a2 = dsp->registers[DSP_REG_A2 + reg];
+    if (__builtin_expect((a2 == 0 && value <= 0x007FFFFF) || 
+                         (a2 == 0xFF && value >= 0x00800000), 1)) {
+        *dest = value;
+        return 0;
     }
 
-    if (dsp->registers[DSP_REG_A2+reg] == 0xff) {
-        if (value >= 0x00800000) {
-            /* No limiting */
-            *dest=value;
-            return 0;
-        }
-    }
-
-    if (dsp->registers[DSP_REG_A2+reg] & (1<<7)) {
-        /* Limited to maximum negative value */
-        *dest=0x00800000;
-        dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_L);
-        got_limited=1;
-    } else {
-        /* Limited to maximal positive value */
-        *dest=0x007fffff;
-        dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_L);
-        got_limited=1;
-    }
-
-    return got_limited;
+    *dest = (a2 & 0x80) ? 0x00800000 : 0x007FFFFF;
+    dsp->registers[DSP_REG_SR] |= (1 << DSP_SR_L);
+    return 1;
 }
 
 static void emu_pm_0(dsp_core_t* dsp)
@@ -6719,14 +6723,14 @@ static void emu_do_aa(dsp_core_t* dsp)
     /* y:aa */
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
     dsp->cur_inst_len++;
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
 
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
-    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & BITMASK(16);
+    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & BITMASK(24);
 
     dsp->instr_cycle += 4;
 }
@@ -6736,7 +6740,7 @@ static void emu_do_imm(dsp_core_t* dsp)
     /* #xx */
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
     dsp->cur_inst_len++;
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
@@ -6755,7 +6759,7 @@ static void emu_do_ea(dsp_core_t* dsp)
     /* y:ea */
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
     dsp->cur_inst_len++;
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
@@ -6763,7 +6767,7 @@ static void emu_do_ea(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     ea_mode = (dsp->cur_inst>>8) & BITMASK(6);
     emu_calc_ea(dsp, ea_mode, &addr);
-    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & BITMASK(16);
+    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & BITMASK(24);
 
     dsp->instr_cycle += 4;
 }
@@ -6775,7 +6779,7 @@ static void emu_do_reg(dsp_core_t* dsp)
     /* S */
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
     dsp->cur_inst_len++;
 
     numreg = (dsp->cur_inst>>8) & BITMASK(6);
@@ -6784,7 +6788,7 @@ static void emu_do_reg(dsp_core_t* dsp)
     } else {
         dsp->registers[DSP_REG_LC] = dsp->registers[numreg];
     }
-    dsp->registers[DSP_REG_LC] &= BITMASK(16);
+    dsp->registers[DSP_REG_LC] &= BITMASK(24);
 
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
@@ -6798,7 +6802,7 @@ static void emu_dor_imm(dsp_core_t* dsp)
     dsp->cur_inst_len++;
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = (dsp->pc + xxxx) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = (dsp->pc + xxxx) & BITMASK(24);
 
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
@@ -6815,7 +6819,7 @@ static void emu_dor_reg(dsp_core_t* dsp)
     dsp->cur_inst_len++;
 
     dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
-    dsp->registers[DSP_REG_LA] = (dsp->pc + xxxx) & BITMASK(16);
+    dsp->registers[DSP_REG_LA] = (dsp->pc + xxxx) & BITMASK(24);
 
     dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
     dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF);
@@ -6826,7 +6830,18 @@ static void emu_dor_reg(dsp_core_t* dsp)
     } else {
         dsp->registers[DSP_REG_LC] = dsp->registers[numreg];
     }
-    dsp->registers[DSP_REG_LC] &= BITMASK(16);
+    dsp->registers[DSP_REG_LC] &= BITMASK(24);
+
+    dsp->instr_cycle += 4;
+}
+
+static void emu_do_forever(dsp_core_t* dsp)
+{
+    dsp_stack_push(dsp, dsp->registers[DSP_REG_LA], dsp->registers[DSP_REG_LC], 0);
+    dsp->registers[DSP_REG_LA] = read_memory_p(dsp, dsp->pc+1) & BITMASK(24);
+    dsp->cur_inst_len++;
+    dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
+    dsp->registers[DSP_REG_SR] |= (1<<DSP_SR_LF) | (1<<DSP_SR_FV);
 
     dsp->instr_cycle += 4;
 }
@@ -6836,8 +6851,8 @@ static void emu_enddo(dsp_core_t* dsp)
     uint32_t saved_pc, saved_sr;
 
     dsp_stack_pop(dsp, &saved_pc, &saved_sr);
-    dsp->registers[DSP_REG_SR] &= 0x7f;
-    dsp->registers[DSP_REG_SR] |= saved_sr & (1<<DSP_SR_LF);
+    dsp->registers[DSP_REG_SR] &= ~((1 << DSP_SR_LF) | (1 << DSP_SR_FV));
+    dsp->registers[DSP_REG_SR] |= saved_sr & ((1 << DSP_SR_LF) | (1 << DSP_SR_FV));
     dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
 }
 
@@ -7418,7 +7433,7 @@ static void emu_lua_rel(dsp_core_t* dsp)
 
 static void emu_movec_reg(dsp_core_t* dsp)
 {
-    uint32_t numreg1, numreg2, value, dummy;
+    uint32_t numreg1, numreg2, value;
 
     /* S1,D2 */
     /* S2,D1 */
@@ -7439,7 +7454,10 @@ static void emu_movec_reg(dsp_core_t* dsp)
     } else {
         /* Read S1 */
         if (numreg1 == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg1 == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else {
             value = dsp->registers[numreg1];
@@ -7463,7 +7481,7 @@ static void emu_movec_reg(dsp_core_t* dsp)
 
 static void emu_movec_aa(dsp_core_t* dsp)
 {
-    uint32_t numreg, addr, memspace, value, dummy;
+    uint32_t numreg, addr, memspace, value;
 
     /* x:aa,D1 */
     /* S1,x:aa */
@@ -7482,7 +7500,10 @@ static void emu_movec_aa(dsp_core_t* dsp)
     } else {
         /* Read S1 */
         if (numreg == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else {
             value = dsp->registers[numreg];
@@ -7504,7 +7525,7 @@ static void emu_movec_imm(dsp_core_t* dsp)
 
 static void emu_movec_ea(dsp_core_t* dsp)
 {
-    uint32_t numreg, addr, memspace, ea_mode, value, dummy;
+    uint32_t numreg, addr, memspace, ea_mode, value;
     int retour;
 
     /* x:ea,D1 */
@@ -7531,7 +7552,10 @@ static void emu_movec_ea(dsp_core_t* dsp)
         /* Read S1 */
         emu_calc_ea(dsp, ea_mode, &addr);
         if (numreg == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else {
             value = dsp->registers[numreg];
@@ -7542,7 +7566,7 @@ static void emu_movec_ea(dsp_core_t* dsp)
 
 static void emu_movem_aa(dsp_core_t* dsp)
 {
-    uint32_t numreg, addr, value, dummy;
+    uint32_t numreg, addr, value;
 
     numreg = dsp->cur_inst & BITMASK(6);
     addr = (dsp->cur_inst>>8) & BITMASK(6);
@@ -7555,7 +7579,10 @@ static void emu_movem_aa(dsp_core_t* dsp)
     } else {
         /* Read S */
         if (numreg == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else if ((numreg == DSP_REG_A) || (numreg == DSP_REG_B)) {
             emu_pm_read_accu24(dsp, numreg, &value);
@@ -7571,7 +7598,7 @@ static void emu_movem_aa(dsp_core_t* dsp)
 
 static void emu_movem_ea(dsp_core_t* dsp)
 {
-    uint32_t numreg, addr, ea_mode, value, dummy;
+    uint32_t numreg, addr, ea_mode, value;
 
     numreg = dsp->cur_inst & BITMASK(6);
     ea_mode = (dsp->cur_inst>>8) & BITMASK(6);
@@ -7585,7 +7612,10 @@ static void emu_movem_ea(dsp_core_t* dsp)
     } else {
         /* Read S */
         if (numreg == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else if ((numreg == DSP_REG_A) || (numreg == DSP_REG_B)) {
             emu_pm_read_accu24(dsp, numreg, &value);
@@ -7606,7 +7636,7 @@ static void emu_movep_0(dsp_core_t* dsp)
     /* S,y:pp */
     /* y:pp,D */
 
-    uint32_t addr, memspace, numreg, value, dummy;
+    uint32_t addr, memspace, numreg, value;
 
     addr = 0xffffc0 + (dsp->cur_inst & BITMASK(6));
     memspace = (dsp->cur_inst>>16) & 1;
@@ -7618,7 +7648,10 @@ static void emu_movep_0(dsp_core_t* dsp)
             emu_pm_read_accu24(dsp, numreg, &value);
         }
         else if (numreg == DSP_REG_SSH) {
-            dsp_stack_pop(dsp, &value, &dummy);
+            value = dsp_stack_pop_ssh(dsp);
+        }
+        else if (numreg == DSP_REG_SSL) {
+            value = dsp->stack[1][dsp->registers[DSP_REG_SP] & BITMASK(4)] & BITMASK(24);
         }
         else {
             value = dsp->registers[numreg];
@@ -8010,6 +8043,10 @@ static void emu_rts(dsp_core_t* dsp)
 static void emu_stop(dsp_core_t* dsp)
 {
     DPRINTF("Dsp: STOP instruction\n");
+    dsp->is_idle = true;
+    if (dsp->opaque) {
+        dsp_set_halt_requested((DSPState *)dsp->opaque, true);
+    }
 }
 
 static void emu_sub_x(dsp_core_t* dsp, uint32_t x, uint32_t d)
@@ -8118,6 +8155,10 @@ static void emu_tcc(dsp_core_t* dsp)
 static void emu_wait(dsp_core_t* dsp)
 {
     DPRINTF("Dsp: WAIT instruction\n");
+    dsp->is_idle = true;
+    if (dsp->opaque) {
+        dsp_set_halt_requested((DSPState *)dsp->opaque, true);
+    }
 }
 
 
