@@ -33,7 +33,15 @@ jobs:
       run: |
         curl -L https://github.com/xemu-project/xemu/commit/eabf6db52c15e12cf856e768e02cbdb68435efd1.patch -o /tmp/fix2.patch
         patch -p1 --fuzz=3 --forward < /tmp/fix2.patch || true
-    
+    - name: Apply upstream patch 3
+      run: |
+        curl -L https://github.com/xemu-project/xemu/commit/b29f7848536582baf8a252187cfb82df03d10042.patch -o /tmp/fix3.patch
+        git apply --3way /tmp/fix3.patch
+    - name: Apply upstream patch 4
+      run: |
+        curl -L https://github.com/xemu-project/xemu/commit/0b35741a9abbdea656016df9d0dbe1785308e7d3.patch -o /tmp/fix4.patch
+        git apply --3way /tmp/fix4.patch
+        
     - name: Install dependencies
       run: sudo apt-get install meson
     - name: Determine release version
