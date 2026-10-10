@@ -1,0 +1,211 @@
+--- a/hw/xbox/nv2a/pgraph/vk/blit.c
++++ b/hw/xbox/nv2a/pgraph/vk/blit.c
+@@ -129,6 +129,14 @@
+     hwaddr dest_offset = image_blit->out_y * context_surfaces->dest_pitch +
+                          image_blit->out_x * bytes_per_pixel;
+ 
++    if (image_blit->operation == NV09F_SET_OPERATION_SRCCOPY &&
++        context_surfaces->color_format == NV062_SET_COLOR_FORMAT_LE_A8R8G8B8 &&
++        source + source_offset == dest + dest_offset &&
++        context_surfaces->source_pitch == context_surfaces->dest_pitch) {
++        // Keep the scaled surface; the guest RAM copy was synchronized above.
++        return;
++    }
++
+     size_t max_row_pixels =
+         MIN(context_surfaces->source_pitch, context_surfaces->dest_pitch) /
+         bytes_per_pixel;
+@@ -154,7 +162,38 @@
+         leftover_bytes = clipped_dest_size - consumed_bytes;
+     }
+ 
++    bool gpu_copy = pg->surface_scale_factor > 1 && surf_src &&
++                    surf_src->color && !surf_src->swizzle &&
++                    surf_src->initialized && !surf_src->upload_pending &&
++                    surf_src->shape.color_format ==
++                        NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 &&
++                    context_surfaces->color_format ==
++                        NV062_SET_COLOR_FORMAT_LE_A8R8G8B8 &&
++                    image_blit->operation == NV09F_SET_OPERATION_SRCCOPY &&
++                    !source_offset && !dest_offset &&
++                    image_blit->width == surf_src->width &&
++                    image_blit->height == surf_src->height &&
++                    context_surfaces->source_pitch == image_blit->width * 4 &&
++                    context_surfaces->dest_pitch == context_surfaces->source_pitch &&
++                    row_pixels == image_blit->width &&
++                    clipped_dest_size == dest_size &&
++                    (dest_addr + dest_size <= source_addr ||
++                     source_addr + surf_src->size <= dest_addr);
++
+     SurfaceBinding *surf_dest = pgraph_vk_surface_get(d, dest_addr);
++    if (gpu_copy && (!surf_dest || !surf_dest->color)) {
++        surf_dest = pgraph_vk_surface_create_blit_dest(d, surf_src,
++                                                       dest_addr);
++        gpu_copy = surf_dest != NULL;
++    }
++    if (gpu_copy && surf_dest) {
++        gpu_copy = surf_dest->color && !surf_dest->swizzle &&
++                   surf_dest->width == surf_src->width &&
++                   surf_dest->height == surf_src->height &&
++                   surf_dest->pitch == surf_src->pitch &&
++                   surf_dest->host_fmt.vk_format ==
++                       surf_src->host_fmt.vk_format;
++    }
+     if (surf_dest) {
+         if (adjusted_height < surf_dest->height ||
+             row_pixels < surf_dest->width) {
+@@ -224,4 +263,8 @@
+                                    DIRTY_MEMORY_VGA);
+     memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
+                                    DIRTY_MEMORY_NV2A_TEX);
++
++    if (gpu_copy) {
++        pgraph_vk_surface_copy_blit(d, surf_src, surf_dest);
++    }
+ }
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.h
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
+@@ -511,6 +511,11 @@
+ void pgraph_vk_surface_flush(NV2AState *d);
+ void pgraph_vk_process_pending_downloads(NV2AState *d);
+ void pgraph_vk_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface);
++SurfaceBinding *pgraph_vk_surface_create_blit_dest(NV2AState *d,
++                                                   SurfaceBinding *source,
++                                                   hwaddr dest_addr);
++void pgraph_vk_surface_copy_blit(NV2AState *d, SurfaceBinding *source,
++                                 SurfaceBinding *dest);
+ SurfaceBinding *pgraph_vk_surface_get_within(NV2AState *d, hwaddr addr);
+ void pgraph_vk_wait_for_surface_download(SurfaceBinding *e);
+ void pgraph_vk_download_dirty_surfaces(NV2AState *d);
+diff --git a/hw/xbox/nv2a/pgraph/vk/surface.c b/hw/xbox/nv2a/pgraph/vk/surface.c
+--- a/hw/xbox/nv2a/pgraph/vk/surface.c
++++ b/hw/xbox/nv2a/pgraph/vk/surface.c
+@@ -682,6 +682,8 @@
+     }
+ }
+ 
++static void create_surface_image(PGRAPHState *pg, SurfaceBinding *surface);
++
+ static void surface_put(NV2AState *d, SurfaceBinding *surface)
+ {
+     PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+@@ -692,6 +694,98 @@
+     register_cpu_access_callback(d, surface);
+ 
+     QTAILQ_INSERT_HEAD(&r->surfaces, surface, entry);
++}
++
++SurfaceBinding *pgraph_vk_surface_create_blit_dest(NV2AState *d,
++                                                   SurfaceBinding *source,
++                                                   hwaddr dest_addr)
++{
++    PGRAPHState *pg = &d->pgraph;
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    SurfaceBinding *other;
++
++    SurfaceBinding *existing = pgraph_vk_surface_get(d, dest_addr);
++    if (existing && !existing->color && !existing->swizzle &&
++        existing->vram_addr == dest_addr && existing->size == source->size &&
++        existing->width == source->width &&
++        existing->height == source->height &&
++        existing->pitch == source->pitch) {
++        existing->download_pending = false;
++        existing->draw_dirty = false;
++        if (existing == r->zeta_binding) {
++            pg->surface_zeta.buffer_dirty = true;
++        }
++        invalidate_surface(d, existing);
++    }
++
++    QTAILQ_FOREACH(other, &r->surfaces, entry) {
++        if (dest_addr < other->vram_addr + other->size &&
++            other->vram_addr < dest_addr + source->size) {
++            return NULL;
++        }
++    }
++
++    SurfaceBinding *dest = g_new0(SurfaceBinding, 1);
++
++    dest->vram_addr = dest_addr;
++    dest->shape = source->shape;
++    dest->dma_addr = dest_addr;
++    dest->dma_len = source->size;
++    dest->color = true;
++    dest->width = source->width;
++    dest->height = source->height;
++    dest->pitch = source->pitch;
++    dest->size = source->size;
++    dest->fmt = source->fmt;
++    dest->host_fmt = source->host_fmt;
++    dest->frame_time = pg->frame_time;
++
++    create_surface_image(pg, dest);
++    surface_put(d, dest);
++    return dest;
++}
++
++void pgraph_vk_surface_copy_blit(NV2AState *d, SurfaceBinding *source,
++                                 SurfaceBinding *dest)
++{
++    PGRAPHState *pg = &d->pgraph;
++    VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
++    VkFormat format = source->host_fmt.vk_format;
++
++    pgraph_vk_transition_image_layout(pg, cmd, source->image, format,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    pgraph_vk_transition_image_layout(pg, cmd, dest->image, format,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++
++    VkImageCopy region = {
++        .srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .srcSubresource.layerCount = 1,
++        .dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .dstSubresource.layerCount = 1,
++        .extent.width = source->width * pg->surface_scale_factor,
++        .extent.height = source->height * pg->surface_scale_factor,
++        .extent.depth = 1,
++    };
++    vkCmdCopyImage(cmd, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                   dest->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                   &region);
++
++    pgraph_vk_transition_image_layout(pg, cmd, source->image, format,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    pgraph_vk_transition_image_layout(pg, cmd, dest->image, format,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    pgraph_vk_end_nondraw_commands(pg, cmd);
++
++    dest->initialized = true;
++    dest->upload_pending = false;
++    dest->download_pending = false;
++    dest->draw_dirty = false;
++    dest->frame_time = pg->frame_time;
++    dest->draw_time = pg->draw_time;
+ }
+ 
+ SurfaceBinding *pgraph_vk_surface_get(NV2AState *d, hwaddr addr)
+diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
+--- a/hw/xbox/nv2a/pgraph/vk/draw.c
++++ b/hw/xbox/nv2a/pgraph/vk/draw.c
+@@ -1445,9 +1445,14 @@
+                      vp_height = pg->surface_binding_dim.height;
+         pgraph_apply_scaling_factor(pg, &vp_width, &vp_height);
+ 
++        float vp_offset = pg->surface_scale_factor > 1
++                              ? 0.5f * (pg->surface_scale_factor - 1) + 0.25f
++                              : 0.0f;
+         VkViewport viewport = {
+-            .width = vp_width,
+-            .height = vp_height,
++            .x = -vp_offset,
++            .y = -vp_offset,
++            .width = vp_width + vp_offset,
++            .height = vp_height + vp_offset,
+             .minDepth = 0.0,
+             .maxDepth = 1.0,
+         };
