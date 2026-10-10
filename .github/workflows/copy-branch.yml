@@ -16,7 +16,7 @@ jobs:
 
       - name: Push to my repo
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT: ${{ secrets.PAT }}
         run: |
-          git remote add mine https://x-access-token:${GITHUB_TOKEN}@github.com/player1byd/xemu.git
+          git remote add mine https://x-access-token:${PAT}@github.com/player1byd/xemu.git
           git push mine HEAD:refs/heads/perf-experimental
