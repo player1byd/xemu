@@ -3,21 +3,9 @@ name: CI
 on:
   workflow_dispatch:
 
-# Builds start only by hand: Actions tab, CI, Run workflow.
-# pull_request:
-# push:
-#   branches-ignore:
-#     - master
-#   tags-ignore:
-#     - "v*"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     name: Build
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ github.ref }}
+      ref: perf-experimental
