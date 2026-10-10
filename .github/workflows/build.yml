@@ -24,6 +24,16 @@ jobs:
       with:
         fetch-depth: 0
         ref: ${{ inputs.ref }}
+    - name: Apply upstream patch 1
+      run: |
+        curl -L https://github.com/xemu-project/xemu/commit/eabf6db52c15e12cf856e768e02cbdb68435efd1.patch -o /tmp/fix1.patch
+        patch -p1 --fuzz=3 --forward < /tmp/fix1.patch || true
+
+    - name: Apply upstream patch 2
+      run: |
+        curl -L https://https://github.com/xemu-project/xemu/commit/7d28b0f67915f4664e29ee9c23df0490fdcd8e91.patch -o /tmp/fix2.patch
+        patch -p1 --fuzz=3 --forward < /tmp/fix2.patch || true    
+    
     - name: Install dependencies
       run: sudo apt-get install meson
     - name: Determine release version
