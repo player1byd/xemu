@@ -1,6 +1,7 @@
 name: CI
 
 on:
+   workflow_dispatch
   # Builds start only by hand: Actions tab, CI, Run workflow.
   workflow_dispatch:
   # pull_request:
