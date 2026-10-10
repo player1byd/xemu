@@ -1,12 +1,14 @@
 name: Build
 
 on:
+  workflow_dispatch:
   workflow_call:
     inputs:
       ref:
         description: Git ref (commit, branch, or tag) to build
         required: true
         type: string
+        default: 'perf-experimental'
     outputs:
       pkg_version:
         description: Build version
