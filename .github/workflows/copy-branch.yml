@@ -1,0 +1,14 @@
+name: Copy External Branch
+on: workflow_dispatch
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Tovarichtch/xemu
+          ref: perf-experimental
+          fetch-depth: 0
+      - run: |
+          git remote add mine https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/player1byd/xemu.git
+          git push mine HEAD:refs/heads/copy perf-experimental
