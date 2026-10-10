@@ -1,14 +1,10 @@
 name: CI
 
 on:
-  # Builds start only by hand: Actions tab, CI, Run workflow.
   workflow_dispatch:
-  # pull_request:
-  # push:
-  #   branches-ignore:
-  #     - master
-  #   tags-ignore:
-  #     - "v*"
+  push:
+    branches:
+      - perf-experimental
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
