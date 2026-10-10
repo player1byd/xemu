@@ -7,16 +7,19 @@ jobs:
   copy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout external branch
+      - name: Checkout my repo
         uses: actions/checkout@v4
         with:
-          repository: Tovarichtch/xemu
-          ref: perf-experimental
+          repository: player1byd/xemu
+          ref: master
+          token: ${{ secrets.PAT }}
           fetch-depth: 0
 
-      - name: Push to my repo
-        env:
-          PAT: ${{ secrets.PAT }}
+      - name: Fetch external branch
         run: |
-          git remote add mine https://x-access-token:${PAT}@github.com/player1byd/xemu.git
-          git push mine HEAD:refs/heads/perf-experimental
+          git remote add external https://github.com/Tovarichtch/xemu.git
+          git fetch external perf-experimental
+          git checkout -B perf-experimental external/perf-experimental
+
+      - name: Push
+        run: git push origin perf-experimental
