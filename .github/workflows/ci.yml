@@ -3,7 +3,6 @@ name: CI
 on:
   workflow_dispatch:
   # Builds start only by hand: Actions tab, CI, Run workflow.
-  
   # pull_request:
   # push:
   #   branches-ignore:
