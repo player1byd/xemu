@@ -618,6 +618,31 @@ static void pgraph_method_non_inc(MethodFunc handler, METHOD_HANDLER_ARG_DECL)
     }                                                             \
     DEF_METHOD_INT(gclass, name)
 
+/*
+ * Only batch register setters that cannot draw, stall, or change objects.
+ * The gap between FILTER and IMAGE_RECT must still reach normal dispatch.
+ */
+static unsigned int pgraph_texture_state_batch_end(unsigned int method)
+{
+    if (method < NV097_SET_TEXTURE_OFFSET ||
+        method >= NV097_SET_TEXTURE_OFFSET + 4 * 64) {
+        return 0;
+    }
+
+    unsigned int slot_offset =
+        ((method - NV097_SET_TEXTURE_OFFSET) / 64) * 64;
+    unsigned int slot_method = method - slot_offset;
+
+    if (slot_method <= NV097_SET_TEXTURE_FILTER) {
+        return NV097_SET_TEXTURE_FILTER + slot_offset + 4;
+    }
+    if (slot_method >= NV097_SET_TEXTURE_IMAGE_RECT &&
+        slot_method <= NV097_SET_TEXTURE_BORDER_COLOR) {
+        return NV097_SET_TEXTURE_BORDER_COLOR + slot_offset + 4;
+    }
+    return 0;
+}
+
 int pgraph_method(NV2AState *d, unsigned int subchannel,
                    unsigned int method, uint32_t parameter,
                    uint32_t *parameters, size_t num_words_available,
@@ -777,8 +802,37 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
             goto unhandled;
         }
         size_t num_words_consumed = 1;
-        handler(d, pg, subchannel, method, parameter, parameters,
-                num_words_available, &num_words_consumed, inc);
+        unsigned int texture_end = inc && num_words_available > 1 ?
+            pgraph_texture_state_batch_end(method) : 0;
+        if (texture_end) {
+            /*
+             * PFIFO already supplies the packet's remaining word count.
+             * Consume adjacent texture setters under the existing PGRAPH
+             * lock, just as the range handlers do for matrices and vertices.
+             */
+            size_t count = MIN(num_words_available, (texture_end - method) / 4);
+            for (size_t i = 0; i < count; i++) {
+                unsigned int next_method = method + 4 * i;
+                uint32_t next_parameter = i ? ldl_le_p(parameters + i) :
+                                             parameter;
+                MethodFunc next_handler =
+                    pgraph_kelvin_methods[METHOD_ADDR_TO_INDEX(next_method)]
+                        .handler;
+                assert(next_handler != NULL);
+                if (i) {
+                    pgraph_method_log(subchannel, graphics_class, next_method,
+                                      next_parameter);
+                }
+                size_t consumed = 1;
+                next_handler(d, pg, subchannel, next_method, next_parameter,
+                             parameters + i, 1, &consumed, true);
+                assert(consumed == 1);
+            }
+            num_words_consumed = count;
+        } else {
+            handler(d, pg, subchannel, method, parameter, parameters,
+                    num_words_available, &num_words_consumed, inc);
+        }
 
         /* Squash repeated BEGIN,DRAW_ARRAYS,END */
         #define LAM(i, mthd) ((parameters[i*2+1] & 0x31fff) == (mthd))
@@ -1122,6 +1176,7 @@ DEF_METHOD(NV097, SET_FOG_MODE)
         mode = NV_PGRAPH_CONTROL_3_FOG_MODE_LINEAR_ABS; break;
     default:
         assert(!"Invalid or unimplemented fog mode");
+        abort();
         break;
     }
     PG_SET_MASK(NV_PGRAPH_CONTROL_3, NV_PGRAPH_CONTROL_3_FOG_MODE,
@@ -1144,6 +1199,7 @@ DEF_METHOD(NV097, SET_FOG_GEN_MODE)
         mode = NV_PGRAPH_CSV0_D_FOGGENMODE_FOG_X; break;
     default:
         assert(!"Invalid fog gen mode");
+        abort();
         break;
     }
     PG_SET_MASK(NV_PGRAPH_CSV0_D, NV_PGRAPH_CSV0_D_FOGGENMODE, mode);
@@ -1491,6 +1547,7 @@ static unsigned int kelvin_map_stencil_op(uint32_t parameter)
         op = NV_PGRAPH_CONTROL_2_STENCIL_OP_V_DECR; break;
     default:
         assert(!"Invalid kelvin map stencil operation");
+        abort();
         break;
     }
     return op;
@@ -1563,6 +1620,7 @@ static unsigned int kelvin_map_polygon_mode(uint32_t parameter)
         mode = NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_FILL; break;
     default:
         assert(!"Invalid kelvin map polygon mode");
+        abort();
         break;
     }
     return mode;
@@ -1604,6 +1662,7 @@ DEF_METHOD(NV097, SET_CULL_FACE)
         face = NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK; break;
     default:
         assert(!"Invalid cull face parameter");
+        abort();
         break;
     }
     PG_SET_MASK(NV_PGRAPH_SETUPRASTER, NV_PGRAPH_SETUPRASTER_CULLCTRL, face);
@@ -1676,6 +1735,7 @@ static unsigned int kelvin_map_texgen(uint32_t parameter, unsigned int channel)
         texgen = NV_PGRAPH_CSV1_A_T0_S_NORMAL_MAP; break;
     default:
         assert(!"Invalid kelvin map texgen parameter");
+        abort();
         break;
     }
     return texgen;

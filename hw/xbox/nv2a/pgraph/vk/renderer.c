@@ -90,6 +90,9 @@ static void pgraph_vk_flush(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
 
     pgraph_vk_finish(pg, VK_FINISH_REASON_FLUSH);
+    /* Reset and snapshot loading replace shader inputs without register
+     * writes, so the next draw must rebuild the shader state. */
+    pg->vk_renderer_state->shader_binding = NULL;
     pgraph_vk_surface_flush(d);
     pgraph_vk_mark_textures_possibly_dirty(d, 0, memory_region_size(d->vram));
     pgraph_vk_update_vertex_ram_buffer(&d->pgraph, 0, d->vram_ptr,

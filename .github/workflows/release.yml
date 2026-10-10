@@ -11,11 +11,19 @@ on:
         description: "Tag name for the release"
         required: true
         type: string
+      pkg_version:
+        description: "Explicit package version without a leading v"
+        required: false
+        type: string
       pre-release:
         description: "Create as published pre-release instead of draft release"
         required: false
         type: boolean
         default: false
+
+permissions:
+  actions: write
+  contents: write
 
 jobs:
   build:
@@ -23,18 +31,31 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ inputs.ref }}
+      pkg_version: ${{ inputs.pkg_version }}
+
+  msvc:
+    name: Windows MSVC
+    needs: build
+    uses: ./.github/workflows/windows-msvc.yml
+    with:
+      ref: ${{ inputs.ref }}
+      pkg_version: ${{ needs.build.outputs.pkg_version }}
 
   delete_prerelease:
     name: Delete pre-release
-    needs: build
+    needs: [build, msvc]
     if: ${{ inputs.pre-release }}
     uses: ./.github/workflows/delete-prerelease.yml
 
   release:
     name: Create release
     runs-on: ubuntu-latest
-    needs: [build, delete_prerelease]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    needs: [build, msvc, delete_prerelease]
+    if: >-
+      ${{ always() && needs.build.result == 'success' &&
+      needs.msvc.result == 'success' &&
+      (needs.delete_prerelease.result == 'success' ||
+      needs.delete_prerelease.result == 'skipped') }}
     steps:
     - name: Clone tree
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -50,23 +71,64 @@ jobs:
       with:
         path: dist
         merge-multiple: true
+    - name: Filter release assets
+      run: |
+        find dist -type f -name '*.tgz' -delete
+        find dist -type f \( \
+          -name '*-macos-arm64-unsigned.zip' -o \
+          -name '*-macos-x86_64-unsigned.zip' \
+        \) -delete
+        if [ "${{ inputs.pre-release }}" != "true" ]; then
+          rm -f dist/xemu-msvc-debug.zip dist/xemu-msvc-profile.zip
+          cp "dist/xemu-${{ needs.build.outputs.pkg_version }}-macos-universal-unsigned.zip" \
+             "dist/xemu-${{ needs.build.outputs.pkg_version }}-macos-universal.zip"
+        fi
     - name: Add transitionary package aliases
       if: ${{ !inputs.pre-release }}
       run: |
         pushd dist
         cp xemu-${{ needs.build.outputs.pkg_version }}-windows-x86_64.zip xemu-win-x86_64-release.zip
         cp xemu-${{ needs.build.outputs.pkg_version }}-windows-arm64.zip xemu-win-aarch64-release.zip
+    - name: Normalize MSVC asset names
+      env:
+        PKG_VERSION: ${{ needs.build.outputs.pkg_version }}
+      run: |
+        set -euo pipefail
+        for config in release profile debug; do
+          source="dist/xemu-msvc-${config}.zip"
+          if [ -f "$source" ]; then
+            mv "$source" "dist/xemu-${PKG_VERSION}-msvc-${config}.zip"
+          fi
+        done
+
     - name: Create release
-      uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
       with:
         name: ${{ inputs.pre-release && 'Latest Development Build' || inputs.tag }}
         tag_name: ${{ inputs.tag }}
-        target_commitish: ${{ inputs.pre-release && inputs.ref || '' }}
+        target_commitish: ${{ inputs.ref }}
         body_path: CHANGELOG.md
         draft: ${{ !inputs.pre-release }}
         prerelease: ${{ inputs.pre-release }}
+        make_latest: false
         files: |
           dist/xemu*.tar.zst
           dist/xemu*-win*.zip
           dist/xemu*-macos-universal*.zip
           dist/xemu*.AppImage
+          dist/xemu*-msvc-*.zip
+
+    - name: Keep stable release below development build
+      if: ${{ inputs.pre-release }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        stable_id="$(gh api "repos/$GH_REPO/releases?per_page=100" \
+          --jq '.[] | select(.draft == false and .prerelease == false) | .id' | head -n 1)"
+        if [ -n "$stable_id" ]; then
+          printf '{"make_latest":"false"}' |
+          gh api --method PATCH "repos/$GH_REPO/releases/$stable_id" \
+            --input - >/dev/null
+        fi

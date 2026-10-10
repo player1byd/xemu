@@ -28,10 +28,13 @@
 /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qemu/rcu.h"
+#include "qemu/timer.h"
 #include "qemu-version.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
@@ -56,9 +59,14 @@
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
+#include <float.h>
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+
+#ifdef _WIN32
+#include "xui/win32-dxgi-present.h"
+#endif
 
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
@@ -70,8 +78,42 @@
 #define DPRINTF(...)
 #endif
 
-uint64_t vblank_interval_ns = 16666666LL;
+#define XBOX_EEPROM_VIDEO_STANDARD_OFFSET 0x58
+#define XBOX_EEPROM_VIDEO_SETTINGS_OFFSET 0x94
+#define XBOX_VIDEO_STANDARD_PAL_I 0x00800300
+#define XBOX_VIDEO_SETTINGS_60HZ 0x00400000
+#define XBOX_VIDEO_SETTINGS_50HZ 0x00800000
+
+#define XEMU_DISPLAY_REFRESH_60HZ 60
+#define XEMU_DISPLAY_REFRESH_50HZ 50
+#define XEMU_VBLANK_INTERVAL_60HZ_NS (NANOSECONDS_PER_SECOND / 60)
+#define XEMU_VBLANK_INTERVAL_50HZ_NS (NANOSECONDS_PER_SECOND / 50)
+
+uint64_t vblank_interval_ns = XEMU_VBLANK_INTERVAL_60HZ_NS;
 bool use_vblank_timer_thread = true;
+
+#define XEMU_PRECISE_DELAY_TAIL_NS (2 * SCALE_MS)
+
+static void xemu_delay_until_ns(int64_t deadline_ns)
+{
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t delay_ns = deadline_ns - now_ns;
+
+    if (delay_ns <= 0) {
+        return;
+    }
+
+    if (delay_ns > XEMU_PRECISE_DELAY_TAIL_NS + SCALE_MS) {
+        uint64_t coarse_ms = (delay_ns - XEMU_PRECISE_DELAY_TAIL_NS) / SCALE_MS;
+
+        SDL_Delay((uint32_t)MIN(coarse_ms, UINT32_MAX));
+    }
+
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now_ns < deadline_ns) {
+        SDL_DelayPrecise(deadline_ns - now_ns);
+    }
+}
 
 struct xemu_console {
     DisplayChangeListener dcl;
@@ -280,6 +322,102 @@ static void send_mouse_event(struct xemu_console *scon, int dx, int dy,
     qemu_input_event_sync();
 }
 
+static const char *get_eeprom_path(void)
+{
+    const char *path = g_config.sys.files.eeprom_path;
+
+    if (strlen(path) == 0) {
+        path = xemu_settings_get_default_eeprom_path();
+    }
+
+    return path;
+}
+
+static bool read_eeprom_u32(uint32_t offset, uint32_t *value)
+{
+    uint8_t data[sizeof(uint32_t)];
+    FILE *fd = qemu_fopen(get_eeprom_path(), "rb");
+
+    if (!fd) {
+        return false;
+    }
+
+    if (fseek(fd, offset, SEEK_SET) != 0 ||
+        fread(data, sizeof(data), 1, fd) != 1) {
+        fclose(fd);
+        return false;
+    }
+
+    fclose(fd);
+    *value = ldl_le_p(data);
+    return true;
+}
+
+static int get_configured_display_refresh_hz(void)
+{
+    uint32_t video_standard;
+    uint32_t video_settings = 0;
+
+    if (!read_eeprom_u32(XBOX_EEPROM_VIDEO_STANDARD_OFFSET, &video_standard)) {
+        return XEMU_DISPLAY_REFRESH_60HZ;
+    }
+
+    read_eeprom_u32(XBOX_EEPROM_VIDEO_SETTINGS_OFFSET, &video_settings);
+
+    if (video_standard == XBOX_VIDEO_STANDARD_PAL_I) {
+        if (video_settings & XBOX_VIDEO_SETTINGS_60HZ) {
+            return XEMU_DISPLAY_REFRESH_60HZ;
+        }
+        if (video_settings & XBOX_VIDEO_SETTINGS_50HZ) {
+            return XEMU_DISPLAY_REFRESH_50HZ;
+        }
+        return XEMU_DISPLAY_REFRESH_50HZ;
+    }
+
+    return XEMU_DISPLAY_REFRESH_60HZ;
+}
+
+static uint64_t get_configured_vblank_interval_ns(void)
+{
+    return get_configured_display_refresh_hz() == XEMU_DISPLAY_REFRESH_50HZ ?
+        XEMU_VBLANK_INTERVAL_50HZ_NS : XEMU_VBLANK_INTERVAL_60HZ_NS;
+}
+
+static const SDL_DisplayMode *select_fullscreen_display_mode(
+    SDL_DisplayMode **modes, int num_modes, int target_refresh_hz)
+{
+    const SDL_DisplayMode *best = NULL;
+    double best_refresh_delta = DBL_MAX;
+    int best_area = 0;
+
+    for (int i = 0; i < num_modes; i++) {
+        const SDL_DisplayMode *mode = modes[i];
+        double refresh_rate;
+        double refresh_delta;
+        int area;
+
+        if (!mode) {
+            continue;
+        }
+
+        refresh_rate = mode->refresh_rate;
+        refresh_delta = refresh_rate > 0.0 ?
+            fabs(refresh_rate - target_refresh_hz) : DBL_MAX;
+        area = mode->w * mode->h;
+
+        if (!best ||
+            refresh_delta < best_refresh_delta - 0.1 ||
+            (fabs(refresh_delta - best_refresh_delta) <= 0.1 &&
+             area > best_area)) {
+            best = mode;
+            best_refresh_delta = refresh_delta;
+            best_area = area;
+        }
+    }
+
+    return best;
+}
+
 static void set_full_screen(struct xemu_console *scon, bool set)
 {
     gui_fullscreen = set;
@@ -293,12 +431,15 @@ static void set_full_screen(struct xemu_console *scon, bool set)
                 int num_modes = 0;
                 modes = SDL_GetFullscreenDisplayModes(display, &num_modes);
                 if (modes && num_modes > 0) {
-                    // First mode is the highest resolution, typically the native resolution
-                    mode = modes[0];
+                    mode = select_fullscreen_display_mode(
+                        modes, num_modes, get_configured_display_refresh_hz());
                 }
             }
             if (mode) {
-                fprintf(stderr, "Selected exclusive fullscreen mode: %dx%d pixel_density=%f refresh_rate=%f\n", mode->w, mode->h, mode->pixel_density, mode->refresh_rate);
+                fprintf(stderr, "Selected exclusive fullscreen mode: %dx%d "
+                        "pixel_density=%f refresh_rate=%f target_refresh=%d\n",
+                        mode->w, mode->h, mode->pixel_density,
+                        mode->refresh_rate, get_configured_display_refresh_hz());
             } else {
                 fprintf(stderr, "Failed to get fullscreen display mode: %s\n", SDL_GetError());
             }
@@ -528,8 +669,30 @@ static void handle_windowevent(SDL_Event *ev)
                 g_config.display.window.last_width = ev->window.data1;
                 g_config.display.window.last_height = ev->window.data2;
             }
+
+#ifdef _WIN32
+            if (win32_dxgi_present_is_active()) {
+                int width;
+                int height;
+                if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
+                                               &height)) {
+                    fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
+                                    "responding to resize event.\n");
+                } else {
+                    win32_dxgi_present_resize(width, height);
+                }
+            }
+#endif
         }
         break;
+#ifdef _WIN32
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        if (win32_dxgi_present_is_active()) {
+            win32_dxgi_present_resize(ev->window.data1, ev->window.data2);
+        }
+        break;
+#endif
+
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
         if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
@@ -759,7 +922,7 @@ static void *vblank_timer_thread(void *opaque)
         // Wait until deadline
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (now < next_vblank) {
-            SDL_DelayPrecise(next_vblank - now);
+            xemu_delay_until_ns(next_vblank);
         } else if (now > next_vblank + vblank_interval_ns) {
             // We've fallen behind by more than one frame, reset to avoid
             // rapid-fire catch-up
@@ -795,6 +958,41 @@ static void report_stats(void)
     }
 }
 #endif
+
+static void xemu_set_swap_interval(bool vsync)
+{
+    if (!vsync) {
+        SDL_GL_SetSwapInterval(0);
+        return;
+    }
+
+    if (!SDL_GL_SetSwapInterval(-1)) {
+        SDL_GL_SetSwapInterval(1);
+    }
+}
+
+static int64_t get_render_throttle_interval_ns(struct xemu_console *scon)
+{
+    if (!g_config.display.window.vsync) {
+        return vblank_interval_ns;
+    }
+
+    SDL_DisplayID display = SDL_GetDisplayForWindow(scon->real_window);
+    const SDL_DisplayMode *mode =
+        display ? SDL_GetCurrentDisplayMode(display) : NULL;
+
+    if (!mode || mode->refresh_rate <= 0) {
+        return 0;
+    }
+
+    double host_interval_ns = 1000000000.0 / mode->refresh_rate;
+
+    if (host_interval_ns < (double)vblank_interval_ns * 0.90) {
+        return vblank_interval_ns;
+    }
+
+    return 0;
+}
 
 /**
  * Renders the main interface. Usually called from the main thread,
@@ -836,6 +1034,12 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_main_loop_unlock();
     }
 
+#ifdef _WIN32
+    if (win32_dxgi_present_is_active()) {
+        win32_dxgi_present_begin_frame();
+    }
+#endif
+
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     xemu_snapshots_set_framebuffer_texture(tex, flip_required);
@@ -860,7 +1064,23 @@ static void gl_render_frame(struct xemu_console *scon)
     }
 
     nv2a_release_framebuffer_surface();
+
+#ifdef _WIN32
+    if (win32_dxgi_present_is_active()) {
+        win32_dxgi_present_end_frame(g_config.display.window.vsync);
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr,
+                    "win32_dxgi present failed or unavailable, falling back to "
+                    "SDL_GL_SwapWindow\n");
+            warned = true;
+        }
+        SDL_GL_SwapWindow(scon->real_window);
+    }
+#else
     SDL_GL_SwapWindow(scon->real_window);
+#endif
     assert(glGetError() == GL_NO_ERROR);
 
     qatomic_set(&rendering, false);
@@ -874,8 +1094,22 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
     struct xemu_console *scon = (struct xemu_console *)userdata;
 
-    if (event->type == SDL_EVENT_WINDOW_EXPOSED ||
-        event->type == SDL_EVENT_WINDOW_RESIZED) {
+    if (event->type == SDL_EVENT_WINDOW_RESIZED) {
+#ifdef _WIN32
+        if (win32_dxgi_present_is_active()) {
+            int width;
+            int height;
+            if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
+                                           &height)) {
+                fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
+                                "responding to resize event.\n");
+            } else {
+                win32_dxgi_present_resize(width, height);
+            }
+        }
+#endif
+        gl_render_frame(scon);
+    } else if (event->type == SDL_EVENT_WINDOW_EXPOSED) {
         gl_render_frame(scon);
     }
 
@@ -1092,7 +1326,10 @@ static void display_early_init(DisplayOptions *o)
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
-    SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
+    xemu_set_swap_interval(g_config.display.window.vsync);
+#ifdef _WIN32
+    win32_dxgi_present_init(m_window);
+#endif
     xemu_hud_init(m_window, m_context);
 }
 
@@ -1157,6 +1394,8 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     // Register event watch to handle rendering during these operations.
     SDL_AddEventWatch(event_watch_callback, &scon_list[0]);
 
+    vblank_interval_ns = get_configured_vblank_interval_ns();
+
     if (use_vblank_timer_thread) {
         qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
                            &scon_list[0], QEMU_THREAD_JOINABLE);
@@ -1177,6 +1416,9 @@ static void display_finalize(void)
     }
 
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
+#ifdef _WIN32
+    win32_dxgi_present_cleanup();
+#endif
     SDL_GL_MakeCurrent(NULL, NULL);
     SDL_GL_DestroyContext(m_context);
     SDL_DestroyWindow(m_window);
@@ -1365,12 +1607,45 @@ int main(int argc, char **argv)
     xemu_main_loop_unlock();
 
     struct xemu_console *scon = &scon_list[0];
+    int64_t next_render_ns = 0;
+
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
+
+        int64_t render_interval_ns = get_render_throttle_interval_ns(scon);
+        if (render_interval_ns > 0) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+            if (!next_render_ns) {
+                next_render_ns = now;
+            }
+
+            if (now < next_render_ns) {
+                xemu_delay_until_ns(next_render_ns);
+                continue;
+            }
+        } else {
+            next_render_ns = 0;
+        }
+
         gl_render_frame(scon);
+
+        if (render_interval_ns > 0) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            if (now > next_render_ns + render_interval_ns) {
+                next_render_ns = now + render_interval_ns;
+            } else {
+                next_render_ns += render_interval_ns;
+            }
+        }
     }
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
+#ifdef __linux__
+    // Save settings before display cleanup on Linux to avoid losing config
+    // when NVIDIA EGL driver crashes during atexit handler teardown.
+    xemu_settings_save();
+#endif
     display_finalize();
     return exit_status;
 }

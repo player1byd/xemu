@@ -114,18 +114,19 @@ typedef struct ControllerState {
 } ControllerState;
 
 typedef QTAILQ_HEAD(, ControllerState) ControllerStateList;
-extern ControllerStateList available_controllers;
-extern ControllerState *bound_controllers[4];
-extern const char *bound_drivers[4];
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+extern ControllerStateList available_controllers;
+extern ControllerState *bound_controllers[4];
+extern const char *bound_drivers[4];
+
 extern int *g_keyboard_scancode_map[25];
 
 void xemu_input_init(void);
-void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
+void xemu_input_process_sdl_events(const SDL_Event *event);
 void xemu_input_update_controllers(void);
 void xemu_input_update_controller(ControllerState *state);
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);

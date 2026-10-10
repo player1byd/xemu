@@ -4,6 +4,7 @@ Generate changelog for xemu releases.
 
 This script generates a markdown file that includes:
 - Pull requests merged since the last release
+- Direct commits not associated with a pull request
 - Issues closed since the last release
 - Affected game titles (extracted from issue bodies)
 
@@ -12,6 +13,7 @@ Requires the GitHub CLI (gh) to be installed and authenticated.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,7 +22,7 @@ from urllib.request import urlopen
 from urllib.error import URLError
 
 
-REPO_NAME = "xemu-project/xemu"
+REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "xemu-project/xemu")
 XEMU_TITLE_URL_BASE = "https://xemu.app/titles/"
 XDB_RAW_URL_BASE = "https://raw.githubusercontent.com/xemu-project/xdb/main/titles"
 
@@ -79,7 +81,6 @@ def get_commits_between(from_ref: str, to_ref: str) -> list[str]:
                 "git",
                 "log",
                 "--pretty=format:%H",
-                "--first-parent",
                 f"{from_ref}..{to_ref}",
             ],
             capture_output=True,
@@ -172,10 +173,12 @@ def generate_changelog(
     log("Fetching pull requests for commits...")
     merged_prs: list[dict] = []
     pr_numbers_seen: set[int] = set()
+    direct_commits: list[str] = []
 
-    for sha in commit_shas:
+    for sha in commits:
         pulls = gh_api(f"commits/{sha}/pulls")
         if not pulls:
+            direct_commits.append(sha)
             continue
         for pr in pulls:
             pr_num = pr["number"]
@@ -194,6 +197,7 @@ def generate_changelog(
             log(f"  Found PR #{pr_num}: {pr['title']}")
 
     log(f"Found {len(merged_prs)} merged PRs")
+    log(f"Found {len(direct_commits)} direct commits")
     merged_prs.sort(key=lambda pr: pr.get("merged_at") or "", reverse=True)
 
     log("Fetching closed issues via GraphQL...")
@@ -252,6 +256,28 @@ def generate_changelog(
             lines.append(f"* #{pr['number']} - {pr['title']} (@{pr['user']['login']})")
         lines.append("")
 
+    if direct_commits:
+        lines.append("## Direct Commits")
+        lines.append("")
+        for sha in direct_commits:
+            try:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "show",
+                        "-s",
+                        "--pretty=format:* %h %s",
+                        sha,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                lines.append(result.stdout)
+            except subprocess.CalledProcessError:
+                lines.append(f"* {sha[:10]}")
+        lines.append("")
+
     if closed_issues:
         lines.append("## Issues Fixed")
         lines.append("")
@@ -270,8 +296,8 @@ def generate_changelog(
             lines.append(f"* {title_ref} ({issue_nums})")
         lines.append("")
 
-    if not merged_prs and not closed_issues:
-        log("No PRs or issues found, falling back to git log")
+    if not merged_prs and not closed_issues and not direct_commits:
+        log("No PRs, issues, or direct commits found, falling back to git log")
         lines.append("## Changes")
         lines.append("")
         try:
@@ -280,7 +306,6 @@ def generate_changelog(
                     "git",
                     "log",
                     "--pretty=format:* %h %s",
-                    "--first-parent",
                     f"{previous_tag}..{current_ref}",
                 ],
                 capture_output=True,

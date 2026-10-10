@@ -5,6 +5,10 @@ on:
     branches:
       - master
 
+permissions:
+  actions: write
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
@@ -12,7 +16,7 @@ concurrency:
 jobs:
   release:
     name: Pre-release
-    if: github.repository_owner == 'xemu-project'
+    if: github.repository_owner == 'AITUS95' && github.event.head_commit.message != 'ci-refresh-pre-msvc' && github.event.head_commit.message != 'ci-refresh-pre-msvc-cleanup'
     uses: ./.github/workflows/release.yml
     with:
       ref: ${{ github.sha }}

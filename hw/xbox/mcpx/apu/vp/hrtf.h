@@ -35,7 +35,8 @@
 typedef struct {
     int buf_pos;
     struct {
-        float buf[HRTF_BUFLEN];
+        /* Mirror the ring so every convolution window is contiguous. */
+        float buf[2 * HRTF_BUFLEN];
         float hrir_coeff_cur[HRTF_NUM_TAPS];
         float hrir_coeff_tar[HRTF_NUM_TAPS];
     } ch[2];
@@ -86,6 +87,11 @@ static inline float hrtf_filter_smooth_param(float cur, float tar)
     return cur + HRTF_PARAM_SMOOTH_ALPHA * (tar - cur);
 }
 
+static inline int hrtf_filter_wrap_buf_index(int idx)
+{
+    return idx >= HRTF_BUFLEN ? idx - HRTF_BUFLEN : idx;
+}
+
 static inline void hrtf_filter_step_parameters(HrtfFilter *f)
 {
     for (int ch = 0; ch < 2; ch++) {
@@ -111,6 +117,7 @@ static inline void hrtf_filter_process(HrtfFilter *f,
 
             // Push new sample
             buf[f->buf_pos] = in[n][ch];
+            buf[f->buf_pos + HRTF_BUFLEN] = in[n][ch];
 
             // Interaural time difference (channel delay)
             float d = f->itd_cur * (ch == 0 ? +1.0f : -1.0f);
@@ -120,24 +127,32 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = d;
             float dfrac = d - di;
 
+            /* Start in the mirrored half: all taps and the interpolation
+             * sample then fit without wrapping inside the convolution loop.
+             */
+            int start = hrtf_filter_wrap_buf_index(f->buf_pos - di +
+                                                   HRTF_BUFLEN);
+            const float *history = &buf[start + HRTF_BUFLEN];
+
             // HRIR Convolution
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-
-                // Linear interpolation for fractional part
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
-                    s = s * (1 - dfrac) + buf[idx2] * dfrac;
+            if (dfrac > 0.0f) {
+                float weight = 1.0f - dfrac;
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = history[-k] * weight +
+                              history[-k - 1] * dfrac;
+                    acc += coeff[k] * s;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    acc += coeff[k] * history[-k];
+                }
             }
 
             out[n][ch] = acc;
         }
 
-        f->buf_pos = (f->buf_pos + 1) % HRTF_BUFLEN;
+        f->buf_pos = hrtf_filter_wrap_buf_index(f->buf_pos + 1);
     }
 }
 

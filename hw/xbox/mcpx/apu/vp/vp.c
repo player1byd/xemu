@@ -20,7 +20,10 @@
  */
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
+#include "qemu/rcu.h"
 #include "adpcm.h"
+
+#define DEFAULT_VOICE_WORKERS 2
 
 static const struct {
     hwaddr top, current, next;
@@ -1078,6 +1081,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     break;
                 default:
                     assert(!"Invalid sample size for NV_PAYS_VOICE_CFG_FMT");
+                    abort();
                     break;
                 }
                 samples[sample_count][channel] = fval;
@@ -1607,8 +1611,14 @@ static void *voice_worker_thread(void *arg)
                 memset(self->sample_buf, 0, sizeof(self->sample_buf));
             }
             for (int i = 0; i < self->queue_len; i++) {
+                /*
+                 * Amortize the physical accessors' RCU barriers over one
+                 * voice.  End the section before taking the dispatch lock.
+                 */
+                struct rcu_reader_data *reader = rcu_read_lock_ptr();
                 voice_process(d, self->mixbins, self->sample_buf,
                               self->queue[i].voice, self->queue[i].list);
+                rcu_read_unlock_ptr(reader);
             }
 
             qemu_mutex_lock(&vwd->lock);
@@ -1637,11 +1647,34 @@ static void *voice_worker_thread(void *arg)
         int64_t end_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         g_dbg.vp.workers[worker_id].time_us = end_time - start_time;
 
-        qemu_cond_wait(&vwd->work_pending, &vwd->lock);
+        qemu_cond_wait(&self->work_pending, &vwd->lock);
     } while (!vwd->workers_should_exit);
 
     rcu_unregister_thread();
     return NULL;
+}
+
+static void voice_work_signal_pending_workers(VoiceWorkDispatch *vwd)
+{
+    uint64_t workers_pending = vwd->workers_pending;
+
+    while (workers_pending) {
+        int worker_id = ctz64(workers_pending);
+
+        workers_pending &= workers_pending - 1;
+        qemu_cond_signal(&vwd->workers[worker_id].work_pending);
+    }
+}
+
+static void voice_work_dispatch_inline(MCPXAPUState *d,
+                                       float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                                       VoiceWorkItem item)
+{
+    g_dbg.vp.workers[0].num_voices = 1;
+    /* Match the worker path, including voice_process's early returns. */
+    struct rcu_reader_data *reader = rcu_read_lock_ptr();
+    voice_process(d, mixbins, d->vp.sample_buf, item.voice, item.list);
+    rcu_read_unlock_ptr(reader);
 }
 
 static void voice_work_enqueue(MCPXAPUState *d, int v, int list)
@@ -1664,7 +1697,9 @@ static void voice_work_schedule(MCPXAPUState *d)
 
     for (int i = 0; i < vwd->queue_len; i++) {
         uint32_t src, dst, clr;
+        struct rcu_reader_data *reader = rcu_read_lock_ptr();
         get_voice_bin_src_dst(d, vwd->queue[i].voice, &src, &dst, &clr);
+        rcu_read_unlock_ptr(reader);
 
         // TODO: To simplify submix scheduling, we make a few assumptions based
         // on Xbox software observations. However, the configurability of
@@ -1741,11 +1776,20 @@ voice_work_dispatch(MCPXAPUState *d,
     qemu_mutex_lock(&vwd->lock);
 
     if (vwd->queue_len) {
+        if (vwd->queue_len == 1) {
+            VoiceWorkItem item = vwd->queue[0];
+
+            vwd->queue_len = 0;
+            qemu_mutex_unlock(&vwd->lock);
+            voice_work_dispatch_inline(d, mixbins, item);
+            goto done;
+        }
+
         memset(vwd->mixbins, 0, sizeof(vwd->mixbins));
 
         // Signal workers and wait for completion
         voice_work_schedule(d);
-        qemu_cond_broadcast(&vwd->work_pending);
+        voice_work_signal_pending_workers(vwd);
         qemu_cond_wait(&vwd->work_finished, &vwd->lock);
         assert(!vwd->workers_pending);
         vwd->queue_len = 0;
@@ -1758,17 +1802,21 @@ voice_work_dispatch(MCPXAPUState *d,
         }
     }
 
+    qemu_mutex_unlock(&vwd->lock);
+
+done:
     int64_t end_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     g_dbg.vp.total_worker_time_us = end_time - start_time;
-
-    qemu_mutex_unlock(&vwd->lock);
 }
 
 static void voice_work_init(MCPXAPUState *d)
 {
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
-    int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
+    int num_workers = g_config.audio.vp.num_workers;
+    if (!num_workers) {
+        num_workers = MIN(SDL_GetNumLogicalCPUCores(), DEFAULT_VOICE_WORKERS);
+    }
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;
@@ -1779,9 +1827,9 @@ static void voice_work_init(MCPXAPUState *d)
 
     qemu_mutex_init(&vwd->lock);
     qemu_mutex_lock(&vwd->lock);
-    qemu_cond_init(&vwd->work_pending);
     qemu_cond_init(&vwd->work_finished);
     for (int i = 0; i < vwd->num_workers; i++) {
+        qemu_cond_init(&vwd->workers[i].work_pending);
         vwd->workers_pending |= 1 << i;
         qemu_thread_create(&vwd->workers[i].thread, "mcpx.voice_worker",
                            voice_worker_thread, d, QEMU_THREAD_JOINABLE);
@@ -1797,10 +1845,13 @@ static void voice_work_finalize(MCPXAPUState *d)
 
     qemu_mutex_lock(&vwd->lock);
     vwd->workers_should_exit = true;
-    qemu_cond_broadcast(&vwd->work_pending);
+    for (int i = 0; i < vwd->num_workers; i++) {
+        qemu_cond_signal(&vwd->workers[i].work_pending);
+    }
     qemu_mutex_unlock(&vwd->lock);
     for (int i = 0; i < vwd->num_workers; i++) {
         qemu_thread_join(&vwd->workers[i].thread);
+        qemu_cond_destroy(&vwd->workers[i].work_pending);
     }
     g_free(vwd->workers);
     vwd->workers = NULL;
@@ -1828,10 +1879,17 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
             }
 
             uint16_t v = d->regs[current];
+            /*
+             * Keep the two live register reads in one RCU section, without
+             * extending it across FE methods or worker dispatch/waits.
+             */
+            struct rcu_reader_data *reader = rcu_read_lock_ptr();
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
-            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+            bool active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+            rcu_read_unlock_ptr(reader);
+            if (!active) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 voice_work_enqueue(d, v, list);
