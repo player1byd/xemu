@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/libsdl-org/SDL
-revision = fa2c02bb6e21974a89ea9824bc53c9932abe5f9c
+revision = f00dc919ca35b9756316e86c4777392de442f9b2
 depth = 1
 diff_files = sdl3-3.4.16/0001-windows-guard-partial-clipboard-window.patch
 method = cmake
